@@ -1,3 +1,9 @@
-streamlit
-plotly
-pandas
+
+### 使用说明
+1. 将上述 `app.py`、`requirements.txt`、`README.md` 保存到同一文件夹
+2. 申请 Mapbox Token（免费，注册即可）
+3. 本地运行：`streamlit run app.py`
+4. 侧边栏切换页面，在航线规划页面粘贴 Token 并输入坐标（默认已填入校园内坐标）
+5. 飞行监控会自动开始心跳模拟，每秒产生新数据
+
+代码满足所有新增需求：3D 地图、坐标系转换、障碍物、双页面、心跳监测。
