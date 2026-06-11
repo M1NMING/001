@@ -25,7 +25,6 @@
             flex-direction: column;
             height: 100%;
         }
-        /* 顶部导航栏 */
         .nav-bar {
             background: #0f1a1f;
             padding: 0 24px;
@@ -76,7 +75,6 @@
             opacity: 1;
             visibility: visible;
         }
-        /* 航线规划页面布局 */
         .planning-layout {
             display: flex;
             width: 100%;
@@ -163,7 +161,6 @@
             justify-content: space-between;
             margin-top: 8px;
         }
-        /* 飞行监控页面 */
         .monitor-layout {
             width: 100%;
             height: 100%;
