@@ -38,7 +38,7 @@ def gcj02_to_wgs84(lng, lat):
     return lng * 2 - (lng + dlng), lat * 2 - (lat + dlat)
 
 def wgs84_to_gcj02(lng, lat):
-    """WGS-84 → GCJ-02（反向，同算法）"""
+    """WGS-84 → GCJ-02"""
     a = 6378245.0
     ee = 0.00669342162296594323
     def transform_lat(x, y):
@@ -71,10 +71,10 @@ OBSTACLES_GCJ = [
     {"name": "食堂",   "lng": 118.7483, "lat": 32.2329}
 ]
 
-# ==================== 心跳监测相关 ====================
+# ==================== 心跳监测 ====================
 def init_heartbeat():
     if "heartbeat_list" not in st.session_state:
-        st.session_state.heartbeat_list = []   # [序号, 时间字符串, datetime对象]
+        st.session_state.heartbeat_list = []
     if "last_gen_time" not in st.session_state:
         st.session_state.last_gen_time = None
     if "seq_counter" not in st.session_state:
@@ -102,64 +102,101 @@ def heartbeat_status():
     else:
         return diff, f"✅ 连接正常，最后心跳: {diff:.1f} 秒前"
 
-# ==================== 3D 地图绘制 ====================
-def render_3d_map(A_gcj, B_gcj, height, mapbox_token):
-    """A_gcj, B_gcj: (lng, lat) GCJ-02 坐标"""
-    A_wgs = gcj02_to_wgs84(A_gcj[0], A_gcj[1])
-    B_wgs = gcj02_to_wgs84(B_gcj[0], B_gcj[1])
-    obstacles_wgs = [(gcj02_to_wgs84(o["lng"], o["lat"]), o["name"]) for o in OBSTACLES_GCJ]
-
-    lats = [A_wgs[1], B_wgs[1]]
-    lons = [A_wgs[0], B_wgs[0]]
-    names = ["起点 A", "终点 B"]
-    colors = ["green", "red"]
-    sizes = [15, 15]
-
-    for (lng, lat), name in obstacles_wgs:
-        lats.append(lat)
-        lons.append(lng)
-        names.append(f"障碍物: {name}")
-        colors.append("orange")
-        sizes.append(12)
+# ==================== 地图绘制（支持 Mapbox 或 3D 地球）====================
+def render_mapbox_map(A_wgs, B_wgs, obstacles_wgs, token, height):
+    """使用 Mapbox 卫星图 + 3D 俯仰角"""
+    lats = [A_wgs[1], B_wgs[1]] + [o[0][1] for o in obstacles_wgs]
+    lons = [A_wgs[0], B_wgs[0]] + [o[0][0] for o in obstacles_wgs]
+    names = ["起点 A", "终点 B"] + [f"障碍物: {o[1]}" for o in obstacles_wgs]
+    colors = ["green", "red"] + ["orange"] * len(obstacles_wgs)
+    sizes = [15, 15] + [12] * len(obstacles_wgs)
 
     fig = go.Figure()
-    # 散点
     fig.add_trace(go.Scattermapbox(
         lat=lats, lon=lons,
         mode="markers+text",
-        marker=dict(size=sizes, color=colors, symbol="circle"),
+        marker=dict(size=sizes, color=colors),
         text=names, textposition="top center",
-        hoverinfo="text", name="关键点"
+        name="关键点"
     ))
-    # 航线
     fig.add_trace(go.Scattermapbox(
         lat=[A_wgs[1], B_wgs[1]], lon=[A_wgs[0], B_wgs[0]],
-        mode="lines", line=dict(width=3, color="cyan"), name="规划航线"
+        mode="lines", line=dict(width=3, color="cyan"),
+        name="规划航线"
     ))
     fig.update_layout(
         mapbox=dict(
-            accesstoken=mapbox_token,
+            accesstoken=token,
             style="mapbox://styles/mapbox/satellite-streets-v12",
             center=dict(lat=(A_wgs[1]+B_wgs[1])/2, lon=(A_wgs[0]+B_wgs[0])/2),
             zoom=15, pitch=60, bearing=0
         ),
         margin=dict(l=0, r=0, t=30, b=0), height=600,
-        title=f"🗺️ 3D 航线规划 (飞行高度: {height} m)"
+        title=f"🗺️ 3D 卫星地图 (飞行高度: {height} m)"
     )
     st.plotly_chart(fig, use_container_width=True)
+
+def render_globe_map(A_wgs, B_wgs, obstacles_wgs, height):
+    """无 Mapbox Token 时的备选：3D 地球仪（正交投影）"""
+    lats = [A_wgs[1], B_wgs[1]] + [o[0][1] for o in obstacles_wgs]
+    lons = [A_wgs[0], B_wgs[0]] + [o[0][0] for o in obstacles_wgs]
+    names = ["起点 A", "终点 B"] + [f"障碍物: {o[1]}" for o in obstacles_wgs]
+    colors = ["green", "red"] + ["orange"] * len(obstacles_wgs)
+
+    fig = go.Figure()
+    # 航线条（在大圆上绘制直线需要 mapbox，这里使用 scattergeo 的 lines）
+    fig.add_trace(go.Scattergeo(
+        lon=[A_wgs[0], B_wgs[0]], lat=[A_wgs[1], B_wgs[1]],
+        mode="lines", line=dict(width=3, color="cyan"),
+        name="规划航线"
+    ))
+    fig.add_trace(go.Scattergeo(
+        lon=lons, lat=lats,
+        mode="markers+text",
+        marker=dict(size=12, color=colors),
+        text=names, textposition="top center",
+        name="关键点"
+    ))
+    fig.update_layout(
+        geo=dict(
+            projection_type="orthographic",   # 3D 地球仪
+            showland=True, landcolor="lightgreen",
+            showocean=True, oceancolor="lightblue",
+            showcountries=True, countrycolor="gray",
+            showcoastlines=True, coastlinecolor="black",
+            center=dict(lat=(A_wgs[1]+B_wgs[1])/2, lon=(A_wgs[0]+B_wgs[0])/2),
+            projection_rotation=dict(lon=(A_wgs[0]+B_wgs[0])/2, lat=(A_wgs[1]+B_wgs[1])/2),
+            lonaxis_range=[A_wgs[0]-0.05, A_wgs[0]+0.05],  # 局部放大地图
+            lataxis_range=[A_wgs[1]-0.05, A_wgs[1]+0.05]
+        ),
+        margin=dict(l=0, r=0, t=30, b=0), height=600,
+        title=f"🌍 3D 地球模型 (飞行高度: {height} m)<br><sub>未提供 Mapbox Token，使用内置地球仪</sub>"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_map(A_gcj, B_gcj, height, mapbox_token):
+    """统一入口：将 GCJ-02 坐标转为 WGS-84，并根据 token 选择地图类型"""
+    A_wgs = gcj02_to_wgs84(A_gcj[0], A_gcj[1])
+    B_wgs = gcj02_to_wgs84(B_gcj[0], B_gcj[1])
+    obstacles_wgs = [(gcj02_to_wgs84(o["lng"], o["lat"]), o["name"]) for o in OBSTACLES_GCJ]
+
+    if mapbox_token and mapbox_token.strip() != "":
+        render_mapbox_map(A_wgs, B_wgs, obstacles_wgs, mapbox_token.strip(), height)
+    else:
+        render_globe_map(A_wgs, B_wgs, obstacles_wgs, height)
 
 # ==================== 页面路由 ====================
 def main():
     st.sidebar.title("导航")
     page = st.sidebar.radio("功能页面", ["航线规划", "飞行监控"])
 
-    # 公共侧边栏设置
+    # 公共侧边栏
     st.sidebar.markdown("---")
     st.sidebar.subheader("坐标系设置")
     coord_sys = st.sidebar.selectbox("输入坐标系", ["GCJ-02 (高德/百度)", "WGS-84"])
-    mapbox_token = st.sidebar.text_input("Mapbox Token (必填)", type="password",
-                                         help="注册 mapbox.com 获取免费 token")
-    st.sidebar.info("若地图空白，请检查 Token 且坐标位于校园内 (约 118.74~118.76, 32.23~32.24)")
+    mapbox_token = st.sidebar.text_input("Mapbox Token (选填，不填则用地球仪)", type="password",
+                                         help="注册 mapbox.com 获取免费 token，留空将显示 3D 地球仪")
+    st.sidebar.info("提示：若填了 Token 但仍无地图，请检查网络或 Token 有效性")
 
     # 初始化 A/B 点默认值（校园内 GCJ-02）
     if "A_lat" not in st.session_state:
@@ -170,7 +207,7 @@ def main():
         st.session_state.flight_height = 50
 
     if page == "航线规划":
-        st.header("🗺️ 航线规划 (3D 地图 + 障碍物)")
+        st.header("🗺️ 航线规划 (3D 地图)")
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("起点 A")
@@ -191,18 +228,15 @@ def main():
 
         st.session_state.flight_height = st.number_input("飞行高度 (m)", value=st.session_state.flight_height, step=5)
 
-        if not mapbox_token:
-            st.warning("⚠️ 请在上方侧边栏输入 Mapbox Token 以显示地图")
+        # 坐标转换：根据用户选择的坐标系，转换为内部使用的 GCJ-02
+        if coord_sys == "WGS-84":
+            A_gcj = wgs84_to_gcj02(lng_a, lat_a)
+            B_gcj = wgs84_to_gcj02(lng_b, lat_b)
         else:
-            # 如果用户选择 WGS-84 输入，需要先转成 GCJ-02 再处理（因为障碍物是 GCJ-02）
-            if coord_sys == "WGS-84":
-                # 将用户输入的 WGS-84 坐标转为 GCJ-02 用于计算和显示转换
-                A_gcj = wgs84_to_gcj02(lng_a, lat_a)
-                B_gcj = wgs84_to_gcj02(lng_b, lat_b)
-            else:
-                A_gcj = (lng_a, lat_a)
-                B_gcj = (lng_b, lat_b)
-            render_3d_map(A_gcj, B_gcj, st.session_state.flight_height, mapbox_token)
+            A_gcj = (lng_a, lat_a)
+            B_gcj = (lng_b, lat_b)
+
+        render_map(A_gcj, B_gcj, st.session_state.flight_height, mapbox_token)
 
         with st.expander("📌 障碍物列表 (校园内 GCJ-02)"):
             for obs in OBSTACLES_GCJ:
@@ -231,7 +265,6 @@ def main():
         else:
             st.success(msg)
 
-        # 折线图
         if len(st.session_state.heartbeat_list) >= 2:
             df = pd.DataFrame(st.session_state.heartbeat_list, columns=["序号", "时间", "dt"])
             fig = px.line(df, x="时间", y="序号", title="📈 心跳序号变化趋势",
@@ -243,14 +276,12 @@ def main():
         else:
             st.info("📊 等待心跳数据...")
 
-        # 数据表格
         if st.session_state.heartbeat_list:
             df_table = pd.DataFrame(st.session_state.heartbeat_list[-10:], columns=["序号", "时间", "dt"])
             st.dataframe(df_table.drop(columns=["dt"]), use_container_width=True)
         else:
             st.info("暂无心跳记录")
 
-        # 自动刷新（每秒）
         time.sleep(1)
         st.rerun()
 
