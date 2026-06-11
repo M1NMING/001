@@ -156,6 +156,10 @@ def main():
     if "obstacle_geojson" not in st.session_state:
         st.session_state.obstacle_geojson = load_obstacles()
     
+    # 用于记录是否新增了多边形（避免重复处理）
+    if "last_drawn_geometry" not in st.session_state:
+        st.session_state.last_drawn_geometry = None
+    
     if page == "🗺️ 航线规划 (多边形圈选)":
         left_col, right_col = st.columns([7, 3])
         
@@ -229,11 +233,10 @@ def main():
                     st.success("已清除")
                     st.rerun()
             
-            # ========= 新增：下载配置文件到本地 =========
+            # 下载配置文件
             num_features = get_obstacle_count()
             st.markdown("---")
             st.markdown("#### 📥 下载配置文件到本地")
-            # 将当前的障碍物数据转换为 JSON 字符串
             obstacle_json_str = json.dumps(st.session_state.obstacle_geojson, ensure_ascii=False, indent=2)
             st.download_button(
                 label="📥 下载 obstacle_config.json",
@@ -242,7 +245,6 @@ def main():
                 mime="application/json",
                 help="点击下载当前所有障碍物多边形配置"
             )
-            # 显示文件状态信息
             st.caption(f"文件状态: 共 {num_features} 个障碍物 | 保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 版本: v12.2")
             if num_features > 0:
                 st.success(f"当前配置文件路径示例: ./{CONFIG_FILE}")
@@ -265,20 +267,29 @@ def main():
             if st.session_state.obstacle_geojson.get("features"):
                 folium.GeoJson(st.session_state.obstacle_geojson, name='障碍物', style_function=lambda x: {'color': 'orange', 'weight': 3, 'fillOpacity': 0.3}).add_to(folium_map)
             
-            output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing", "all_drawings"])
+            # 使用 key 参数固定组件，避免重复创建导致消失
+            output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing", "all_drawings"], key="obstacle_map")
             
+            # 处理新绘制的多边形（只在有新的且与上次不同时添加）
             if output and output.get("last_active_drawing"):
                 drawing = output["last_active_drawing"]
                 if drawing and drawing.get("geometry") and drawing["geometry"]["type"] == "Polygon":
-                    new_feature = {
-                        "type": "Feature",
-                        "geometry": drawing["geometry"],
-                        "properties": {"name": f"障碍物_{num_features+1}", "created": datetime.now().isoformat()}
-                    }
-                    st.session_state.obstacle_geojson["features"].append(new_feature)
-                    save_obstacles(st.session_state.obstacle_geojson)
-                    st.success("已添加新障碍物多边形")
-                    st.rerun()
+                    # 避免重复添加同一个多边形（通过几何字符串比较）
+                    geom_str = json.dumps(drawing["geometry"], sort_keys=True)
+                    if geom_str != st.session_state.last_drawn_geometry:
+                        st.session_state.last_drawn_geometry = geom_str
+                        new_feature = {
+                            "type": "Feature",
+                            "geometry": drawing["geometry"],
+                            "properties": {"name": f"障碍物_{num_features+1}", "created": datetime.now().isoformat()}
+                        }
+                        st.session_state.obstacle_geojson["features"].append(new_feature)
+                        save_obstacles(st.session_state.obstacle_geojson)
+                        st.success(f"已添加新障碍物多边形 (当前共 {num_features+1} 个)")
+                        # 不调用 st.rerun()，让地图自然保留
+                        # 轻微延迟后重新运行以刷新右侧计数（但地图不会消失）
+                        time.sleep(0.5)
+                        st.rerun()
     
     elif page == "📡 飞行监控 (心跳监测)":
         st.header("📡 无人机心跳监测 · 实时数据")
