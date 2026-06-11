@@ -7,14 +7,14 @@ import math
 import json
 import os
 from datetime import datetime
-from streamlit_folium import st_folium  # 正确导入
+from streamlit_folium import st_folium
 import folium
 from folium import plugins
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机任务平台 | 多边形圈选 + 心跳监测", layout="wide")
 
-# ==================== 坐标系转换 (GCJ-02 ↔ WGS-84) ====================
+# ==================== 坐标系转换 ====================
 def wgs84_to_gcj02(lng, lat):
     """WGS-84 → GCJ-02"""
     a = 6378245.0
@@ -44,11 +44,10 @@ def wgs84_to_gcj02(lng, lat):
     return lng + dlng, lat + dlat
 
 def gcj02_to_wgs84(lng, lat):
-    """GCJ-02 → WGS-84 近似转换"""
     wgs_lng, wgs_lat = wgs84_to_gcj02(lng, lat)
     return 2*lng - wgs_lng, 2*lat - wgs_lat
 
-# ==================== 心跳监测模块 ====================
+# ==================== 心跳监测 ====================
 def init_heartbeat():
     if "heartbeat_list" not in st.session_state:
         st.session_state.heartbeat_list = []
@@ -79,7 +78,7 @@ def heartbeat_status():
     else:
         return diff, f"✅ 连接正常，最后心跳: {diff:.1f} 秒前"
 
-# ==================== 障碍物持久化配置 ====================
+# ==================== 障碍物持久化 ====================
 CONFIG_FILE = "obstacle_config.json"
 
 def load_obstacles():
@@ -92,10 +91,12 @@ def save_obstacles(geojson):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(geojson, f, ensure_ascii=False, indent=2)
 
-# ==================== 创建带绘制工具的地图 ====================
+def get_obstacle_count():
+    return len(st.session_state.obstacle_geojson.get("features", []))
+
+# ==================== 创建地图 ====================
 def create_map(center_lat, center_lng, zoom_start=16):
     m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_start, control_scale=True)
-    # 卫星图源
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Tiles &copy; Esri',
@@ -110,7 +111,6 @@ def create_map(center_lat, center_lng, zoom_start=16):
         control=True
     ).add_to(m)
     folium.LayerControl().add_to(m)
-    # 绘制控件（多边形）
     draw = plugins.Draw(
         draw_options={
             'polygon': True,
@@ -229,43 +229,54 @@ def main():
                     st.success("已清除")
                     st.rerun()
             
-            num_features = len(st.session_state.obstacle_geojson.get("features", []))
-            st.write(f"**当前障碍物数量**: {num_features}")
+            # ========= 新增：下载配置文件到本地 =========
+            num_features = get_obstacle_count()
+            st.markdown("---")
+            st.markdown("#### 📥 下载配置文件到本地")
+            # 将当前的障碍物数据转换为 JSON 字符串
+            obstacle_json_str = json.dumps(st.session_state.obstacle_geojson, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="📥 下载 obstacle_config.json",
+                data=obstacle_json_str,
+                file_name="obstacle_config.json",
+                mime="application/json",
+                help="点击下载当前所有障碍物多边形配置"
+            )
+            # 显示文件状态信息
+            st.caption(f"文件状态: 共 {num_features} 个障碍物 | 保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 版本: v12.2")
             if num_features > 0:
-                st.caption(f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 版本: v12.2")
+                st.success(f"当前配置文件路径示例: ./{CONFIG_FILE}")
+            else:
+                st.info("暂无障碍物，请在地图上绘制多边形")
         
         with left_col:
             st.markdown("### 🗺️ 卫星实况地图 (可绘制多边形)")
-            # 将A/B点转为WGS-84用于地图显示
+            # 将A/B点转为WGS-84
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
             center_lat = (A_wgs_lat + B_wgs_lat) / 2
             center_lng = (A_wgs_lng + B_wgs_lng) / 2
             
             folium_map = create_map(center_lat, center_lng, zoom_start=16)
-            # 添加A/B标记和航线
             folium.Marker([A_wgs_lat, A_wgs_lng], popup="起点 A", icon=folium.Icon(color='green', icon='play', prefix='fa')).add_to(folium_map)
             folium.Marker([B_wgs_lat, B_wgs_lng], popup="终点 B", icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')).add_to(folium_map)
             folium.PolyLine([[A_wgs_lat, A_wgs_lng], [B_wgs_lat, B_wgs_lng]], color='cyan', weight=4).add_to(folium_map)
             
-            # 加载已保存的障碍物多边形
             if st.session_state.obstacle_geojson.get("features"):
                 folium.GeoJson(st.session_state.obstacle_geojson, name='障碍物', style_function=lambda x: {'color': 'orange', 'weight': 3, 'fillOpacity': 0.3}).add_to(folium_map)
             
-            # 显示地图并获取绘制结果
             output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing", "all_drawings"])
             
-            # 处理新绘制的多边形
             if output and output.get("last_active_drawing"):
                 drawing = output["last_active_drawing"]
                 if drawing and drawing.get("geometry") and drawing["geometry"]["type"] == "Polygon":
                     new_feature = {
                         "type": "Feature",
                         "geometry": drawing["geometry"],
-                        "properties": {"name": f"障碍物_{len(st.session_state.obstacle_geojson['features'])+1}", "created": datetime.now().isoformat()}
+                        "properties": {"name": f"障碍物_{num_features+1}", "created": datetime.now().isoformat()}
                     }
                     st.session_state.obstacle_geojson["features"].append(new_feature)
-                    save_obstacles(st.session_state.obstacle_geojson)  # 自动保存
+                    save_obstacles(st.session_state.obstacle_geojson)
                     st.success("已添加新障碍物多边形")
                     st.rerun()
     
