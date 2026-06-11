@@ -40,11 +40,11 @@ def wgs84_to_gcj02(lng, lat):
     return lng + dlng, lat + dlat
 
 def gcj02_to_wgs84(lng, lat):
-    """GCJ-02 → WGS-84 近似转换（反向）"""
+    """GCJ-02 → WGS-84 近似转换"""
     wgs_lng, wgs_lat = wgs84_to_gcj02(lng, lat)
     return 2*lng - wgs_lng, 2*lat - wgs_lat
 
-# ==================== 障碍物（校园内 GCJ-02 坐标）====================
+# ==================== 障碍物（仅用于右侧面板显示，地图上不绘制）====================
 OBSTACLES_GCJ = [
     {"name": "图书馆", "lng": 118.7498, "lat": 32.2335},
     {"name": "教学楼", "lng": 118.7503, "lat": 32.2340},
@@ -83,18 +83,11 @@ def heartbeat_status():
     else:
         return diff, f"✅ 连接正常，最后心跳: {diff:.1f} 秒前"
 
-# ==================== 生成地图 HTML (Leaflet + Esri 卫星图，垂直俯瞰) ====================
-def generate_map_html(A_lng_wgs, A_lat_wgs, B_lng_wgs, B_lat_wgs, obstacles_wgs, flight_height):
-    """
-    参数: 所有坐标均为 WGS-84 (地图需要的坐标系)
-    """
+# ==================== 生成地图 HTML (Leaflet + Esri 卫星图，垂直俯瞰，无任何障碍物标记) ====================
+def generate_map_html(A_lng_wgs, A_lat_wgs, B_lng_wgs, B_lat_wgs, flight_height):
     center_lng = (A_lng_wgs + B_lng_wgs) / 2
     center_lat = (A_lat_wgs + B_lat_wgs) / 2
-    
-    obstacles_js = "[\n" + ",\n".join([
-        f'{{name: "{obs['name']}", lng: {obs['lng']}, lat: {obs['lat']}}}' for obs in obstacles_wgs
-    ]) + "\n]"
-    
+
     html_code = f"""
 <!DOCTYPE html>
 <html>
@@ -124,45 +117,29 @@ def generate_map_html(A_lng_wgs, A_lat_wgs, B_lng_wgs, B_lat_wgs, obstacles_wgs,
         🖱️ 鼠标拖拽平移 | 滚动缩放 | 垂直俯瞰视角
     </div>
     <script>
-        // 初始化地图 (垂直俯瞰，无倾斜)
         var map = L.map('map').setView([{center_lat}, {center_lng}], 16.5);
-        
-        // 添加 Esri 高分辨率卫星图 (稳定免费，无需Key)
         L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
             attribution: 'Tiles &copy; Esri',
             maxZoom: 19
         }}).addTo(map);
         
-        // 起点 A 标记
-        var markerA = L.marker([{A_lat_wgs}, {A_lng_wgs}], {{
+        // 起点 A
+        L.marker([{A_lat_wgs}, {A_lng_wgs}], {{
             icon: L.divIcon({{ html: '🚁', iconSize: [28,28], className: 'marker-icon' }})
-        }}).bindPopup('<b>起点 A (WGS-84)</b><br>纬度: {A_lat_wgs}<br>经度: {A_lng_wgs}').addTo(map);
+        }}).bindPopup('<b>起点 A</b><br>纬度: {A_lat_wgs}<br>经度: {A_lng_wgs}').addTo(map);
         
-        // 终点 B 标记
-        var markerB = L.marker([{B_lat_wgs}, {B_lng_wgs}], {{
+        // 终点 B
+        L.marker([{B_lat_wgs}, {B_lng_wgs}], {{
             icon: L.divIcon({{ html: '🏁', iconSize: [28,28], className: 'marker-icon' }})
-        }}).bindPopup('<b>终点 B (WGS-84)</b><br>纬度: {B_lat_wgs}<br>经度: {B_lng_wgs}').addTo(map);
+        }}).bindPopup('<b>终点 B</b><br>纬度: {B_lat_wgs}<br>经度: {B_lng_wgs}').addTo(map);
         
-        // 障碍物标记
-        var obstaclesData = {obstacles_js};
-        for (var obs of obstaclesData) {{
-            L.marker([obs.lat, obs.lng], {{
-                icon: L.divIcon({{ html: '⚠️', iconSize: [24,24], className: 'marker-icon' }})
-            }}).bindPopup('<b>' + obs.name + '</b><br>障碍物').addTo(map);
-        }}
-        
-        // 绘制航线连线
+        // 航线连线
         L.polyline([[{A_lat_wgs}, {A_lng_wgs}], [{B_lat_wgs}, {B_lng_wgs}]], {{
-            color: '#00FFFF',
-            weight: 4,
-            opacity: 0.9,
-            lineJoin: 'round'
+            color: '#00FFFF', weight: 4, opacity: 0.9
         }}).addTo(map);
         
-        // 自动调整视野包含所有点
-        var bounds = L.latLngBounds([[{A_lat_wgs}, {A_lng_wgs}], [{B_lat_wgs}, {B_lng_wgs}]]);
-        obstaclesData.forEach(obs => bounds.extend([obs.lat, obs.lng]));
-        map.fitBounds(bounds, {{ padding: [50, 50] }});
+        // 自动调整视野
+        map.fitBounds(L.latLngBounds([[{A_lat_wgs}, {A_lng_wgs}], [{B_lat_wgs}, {B_lng_wgs}]]), {{ padding: [50, 50] }});
     </script>
 </body>
 </html>
@@ -171,28 +148,23 @@ def generate_map_html(A_lng_wgs, A_lat_wgs, B_lng_wgs, B_lat_wgs, obstacles_wgs,
 
 # ==================== 主应用 ====================
 def main():
-    # 侧边栏导航
     st.sidebar.title("✈️ 无人机任务平台")
     page = st.sidebar.radio("功能页面", ["🗺️ 航线规划 (卫星地图)", "📡 飞行监控 (心跳监测)"])
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery (稳定免费) | 垂直俯瞰")
-    
-    # 初始化会话状态 (存储 GCJ-02 坐标)
+    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 垂直俯瞰")
+
     if "A_lat_gcj" not in st.session_state:
         st.session_state.A_lat_gcj = 32.2322
         st.session_state.A_lng_gcj = 118.7490
         st.session_state.B_lat_gcj = 32.2343
         st.session_state.B_lng_gcj = 118.7490
         st.session_state.flight_height = 50
-    
+
     if page == "🗺️ 航线规划 (卫星地图)":
-        # 左右布局: 地图 70%, 控制面板 30%
         left_col, right_col = st.columns([7, 3])
-        
         with right_col:
             st.markdown("### 🎮 控制面板")
             st.markdown("**坐标系: GCJ-02 (高德/百度)**")
-            
             st.markdown("#### 🚁 起点 A")
             a_lat = st.number_input("纬度 (A)", value=st.session_state.A_lat_gcj, format="%.6f", key="a_lat")
             a_lng = st.number_input("经度 (A)", value=st.session_state.A_lng_gcj, format="%.6f", key="a_lng")
@@ -200,7 +172,6 @@ def main():
                 st.session_state.A_lat_gcj = a_lat
                 st.session_state.A_lng_gcj = a_lng
                 st.success("A 点已更新")
-            
             st.markdown("#### 📍 终点 B")
             b_lat = st.number_input("纬度 (B)", value=st.session_state.B_lat_gcj, format="%.6f", key="b_lat")
             b_lng = st.number_input("经度 (B)", value=st.session_state.B_lng_gcj, format="%.6f", key="b_lng")
@@ -208,41 +179,27 @@ def main():
                 st.session_state.B_lat_gcj = b_lat
                 st.session_state.B_lng_gcj = b_lng
                 st.success("B 点已更新")
-            
             st.markdown("#### ✈️ 飞行参数")
             flight_height = st.number_input("飞行高度 (m)", value=st.session_state.flight_height, step=5)
             st.session_state.flight_height = flight_height
-            
             st.markdown("---")
-            st.markdown("#### 🧱 障碍物列表 (GCJ-02)")
+            st.markdown("#### 🧱 障碍物列表 (仅文字参考)")
             for obs in OBSTACLES_GCJ:
                 st.write(f"- {obs['name']}: ({obs['lng']}, {obs['lat']})")
-        
+
         with left_col:
             st.markdown("### 🗺️ 卫星地图 (垂直俯瞰)")
-            # 将 GCJ-02 坐标转换为 WGS-84 (地图瓦片使用 WGS-84)
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
-            # 障碍物坐标也转换
-            obstacles_wgs = []
-            for obs in OBSTACLES_GCJ:
-                wgs_lng, wgs_lat = gcj02_to_wgs84(obs["lng"], obs["lat"])
-                obstacles_wgs.append({"name": obs["name"], "lng": wgs_lng, "lat": wgs_lat})
-            
-            map_html = generate_map_html(
-                A_wgs_lng, A_wgs_lat,
-                B_wgs_lng, B_wgs_lat,
-                obstacles_wgs,
-                flight_height
-            )
+            map_html = generate_map_html(A_wgs_lng, A_wgs_lat, B_wgs_lng, B_wgs_lat, flight_height)
             html(map_html, height=650, scrolling=False)
-    
+
     elif page == "📡 飞行监控 (心跳监测)":
         st.header("📡 无人机心跳监测 · 实时数据")
         init_heartbeat()
         enable = st.sidebar.checkbox("🚁 允许发送心跳", value=True, key="hb_enable")
         update_heartbeat(enable)
-        
+
         col1, col2 = st.columns(2)
         if st.session_state.heartbeat_list:
             latest = st.session_state.heartbeat_list[-1]
@@ -251,7 +208,7 @@ def main():
         else:
             col1.metric("💓 最新序号", "无")
             col2.metric("⏱️ 最新时间", "无")
-        
+
         _, msg = heartbeat_status()
         if "超时" in msg:
             st.error(msg)
@@ -259,7 +216,7 @@ def main():
             st.info(msg)
         else:
             st.success(msg)
-        
+
         if len(st.session_state.heartbeat_list) >= 2:
             df = pd.DataFrame(st.session_state.heartbeat_list, columns=["序号", "时间", "dt"])
             fig = px.line(df, x="时间", y="序号", title="📈 心跳序号趋势", markers=True)
@@ -269,13 +226,13 @@ def main():
             st.info("已收到 1 个心跳，继续接收后显示折线图")
         else:
             st.info("等待心跳数据...")
-        
+
         if st.session_state.heartbeat_list:
             df_tab = pd.DataFrame(st.session_state.heartbeat_list[-10:], columns=["序号", "时间", "dt"])
             st.dataframe(df_tab.drop(columns=["dt"]), use_container_width=True)
         else:
             st.info("暂无记录")
-        
+
         time.sleep(1)
         st.rerun()
 
