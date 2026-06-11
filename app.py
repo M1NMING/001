@@ -1,4 +1,4 @@
-# app.py
+# 使用新的校园中心坐标 (32.234097, 118.749413)
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -145,14 +145,6 @@ def render_maplibre_map(A_lng, A_lat, B_lng, B_lat, obstacles, flight_height):
         }});
 
         map.on('load', function() {{
-            // 添加地形（可选，不影响俯瞰，但增加立体感，可注释掉）
-            // map.addSource('mapbox-dem', {{
-            //     'type': 'raster-dem',
-            //     'url': 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
-            //     'tileSize': 512
-            // }});
-            // map.setTerrain({{ 'source': 'mapbox-dem', 'exaggeration': 1.0 }});
-            
             map.addControl(new maplibregl.NavigationControl({{ visualizePitch: false }}), 'top-right');
 
             // 起点 A 标记
@@ -238,9 +230,9 @@ def main():
 
     # 初始化坐标（精确到南京科技职业学院校园中心，GCJ-02 坐标）
     if "A_lat" not in st.session_state:
-        # 南京科技职业学院正门附近（GCJ-02 坐标，经高德地图标定）
-        st.session_state.A_lat = 32.232200
-        st.session_state.A_lng = 118.749000
+        # 使用精确的校园中心坐标
+        st.session_state.A_lat = 32.234097
+        st.session_state.A_lng = 118.749413
         st.session_state.B_lat = 32.234300
         st.session_state.B_lng = 118.749000
         st.session_state.flight_height = 50
