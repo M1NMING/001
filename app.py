@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -6,7 +7,7 @@ import math
 import json
 import os
 from datetime import datetime
-from streamlit_folium import st_folium
+from streamlit_folium import st_folium  # 正确导入
 import folium
 from folium import plugins
 
@@ -82,22 +83,19 @@ def heartbeat_status():
 CONFIG_FILE = "obstacle_config.json"
 
 def load_obstacles():
-    """从文件加载障碍物GeoJSON"""
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {"type": "FeatureCollection", "features": []}
 
 def save_obstacles(geojson):
-    """保存障碍物GeoJSON到文件"""
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(geojson, f, ensure_ascii=False, indent=2)
 
 # ==================== 创建带绘制工具的地图 ====================
 def create_map(center_lat, center_lng, zoom_start=16):
-    """创建Folium地图，添加多边形绘制工具"""
     m = folium.Map(location=[center_lat, center_lng], zoom_start=zoom_start, control_scale=True)
-    # 添加卫星图源（Esri 卫星）
+    # 卫星图源
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Tiles &copy; Esri',
@@ -105,16 +103,14 @@ def create_map(center_lat, center_lng, zoom_start=16):
         overlay=False,
         control=True
     ).add_to(m)
-    # 添加一个普通街道图作为备选
     folium.TileLayer(
         tiles='OpenStreetMap',
         name='街道图',
         overlay=False,
         control=True
     ).add_to(m)
-    # 添加图层控制
     folium.LayerControl().add_to(m)
-    # 添加绘制控件（允许绘制多边形）
+    # 绘制控件（多边形）
     draw = plugins.Draw(
         draw_options={
             'polygon': True,
@@ -131,26 +127,22 @@ def create_map(center_lat, center_lng, zoom_start=16):
 
 # ==================== 主应用 ====================
 def main():
-    # 侧边栏导航
     st.sidebar.title("✈️ 无人机任务平台")
     page = st.sidebar.radio("功能页面", ["🗺️ 航线规划 (多边形圈选)", "📡 飞行监控 (心跳监测)"])
     st.sidebar.markdown("---")
     
-    # 坐标系设置
     st.sidebar.subheader("坐标系设置")
     coord_sys = st.sidebar.radio("输入坐标系", ["GCJ-02 (高德/百度)", "WGS-84"], index=0)
     
-    # 系统状态
     st.sidebar.subheader("系统状态")
     a_set = ("A_lat_gcj" in st.session_state and "A_lng_gcj" in st.session_state)
     b_set = ("B_lat_gcj" in st.session_state and "B_lng_gcj" in st.session_state)
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
-    
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery\n✏️ 在地图上绘制多边形圈选障碍物\n💾 支持保存/加载配置")
+    st.sidebar.info("🗺️ 卫星图源: Esri\n✏️ 多边形圈选障碍物\n💾 自动保存/加载配置")
     
-    # 初始化A/B点坐标 (GCJ-02)
+    # 初始化A/B点
     if "A_lat_gcj" not in st.session_state:
         st.session_state.A_lat_gcj = 32.2323
         st.session_state.A_lng_gcj = 118.7490
@@ -160,7 +152,7 @@ def main():
     if "flight_height" not in st.session_state:
         st.session_state.flight_height = 10
     
-    # 加载已有障碍物配置
+    # 加载障碍物配置
     if "obstacle_geojson" not in st.session_state:
         st.session_state.obstacle_geojson = load_obstacles()
     
@@ -171,7 +163,7 @@ def main():
             st.markdown("### 🎮 控制面板")
             st.markdown(f"**当前坐标系: {coord_sys}**")
             
-            # ---------- 起点 A ----------
+            # 起点A
             st.markdown("#### 🚁 起点 A")
             if coord_sys == "GCJ-02 (高德/百度)":
                 a_lat = st.number_input("纬度 (A)", value=st.session_state.A_lat_gcj, format="%.6f", key="a_lat")
@@ -189,8 +181,9 @@ def main():
                     st.session_state.A_lat_gcj = gcj_lat
                     st.session_state.A_lng_gcj = gcj_lng
                 st.success("A点已更新")
+                st.rerun()
             
-            # ---------- 终点 B ----------
+            # 终点B
             st.markdown("#### 📍 终点 B")
             if coord_sys == "GCJ-02 (高德/百度)":
                 b_lat = st.number_input("纬度 (B)", value=st.session_state.B_lat_gcj, format="%.6f", key="b_lat")
@@ -208,108 +201,74 @@ def main():
                     st.session_state.B_lat_gcj = gcj_lat
                     st.session_state.B_lng_gcj = gcj_lng
                 st.success("B点已更新")
+                st.rerun()
             
-            # ---------- 飞行高度 ----------
+            # 飞行高度
             st.markdown("#### ✈️ 飞行参数")
             flight_h = st.number_input("设定飞行高度 (m)", value=st.session_state.flight_height, step=1)
             st.session_state.flight_height = flight_h
             
             st.markdown("---")
             st.markdown("#### 🧱 障碍物圈选与持久化")
-            st.caption("在地图上使用多边形工具圈选障碍物区域")
+            st.caption("在地图上绘制多边形，自动保存")
             
             col_btn1, col_btn2, col_btn3 = st.columns(3)
             with col_btn1:
                 if st.button("💾 保存到文件"):
                     save_obstacles(st.session_state.obstacle_geojson)
-                    st.success("障碍物配置已保存")
+                    st.success("已保存")
             with col_btn2:
                 if st.button("📂 从文件加载"):
                     st.session_state.obstacle_geojson = load_obstacles()
-                    st.success("已从文件加载障碍物")
+                    st.success("已加载")
                     st.rerun()
             with col_btn3:
                 if st.button("🗑️ 清除全部"):
                     st.session_state.obstacle_geojson = {"type": "FeatureCollection", "features": []}
                     save_obstacles(st.session_state.obstacle_geojson)
-                    st.success("已清除所有障碍物")
+                    st.success("已清除")
                     st.rerun()
             
-            # 显示当前障碍物数量
             num_features = len(st.session_state.obstacle_geojson.get("features", []))
             st.write(f"**当前障碍物数量**: {num_features}")
             if num_features > 0:
                 st.caption(f"保存时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 版本: v12.2")
         
-        # ---------- 地图显示 (左列) ----------
         with left_col:
-            st.markdown("### 🗺️ 卫星实况地图 (可绘制多边形圈选障碍物)")
-            # 将A/B点转换为WGS-84用于地图显示
+            st.markdown("### 🗺️ 卫星实况地图 (可绘制多边形)")
+            # 将A/B点转为WGS-84用于地图显示
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
             center_lat = (A_wgs_lat + B_wgs_lat) / 2
             center_lng = (A_wgs_lng + B_wgs_lng) / 2
             
-            # 创建地图
             folium_map = create_map(center_lat, center_lng, zoom_start=16)
+            # 添加A/B标记和航线
+            folium.Marker([A_wgs_lat, A_wgs_lng], popup="起点 A", icon=folium.Icon(color='green', icon='play', prefix='fa')).add_to(folium_map)
+            folium.Marker([B_wgs_lat, B_wgs_lng], popup="终点 B", icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')).add_to(folium_map)
+            folium.PolyLine([[A_wgs_lat, A_wgs_lng], [B_wgs_lat, B_wgs_lng]], color='cyan', weight=4).add_to(folium_map)
             
-            # 添加A/B点标记
-            folium.Marker(
-                location=[A_wgs_lat, A_wgs_lng],
-                popup=f"起点 A<br>lat: {A_wgs_lat:.6f}<br>lng: {A_wgs_lng:.6f}",
-                icon=folium.Icon(color='green', icon='play', prefix='fa')
-            ).add_to(folium_map)
-            folium.Marker(
-                location=[B_wgs_lat, B_wgs_lng],
-                popup=f"终点 B<br>lat: {B_wgs_lat:.6f}<br>lng: {B_wgs_lng:.6f}",
-                icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')
-            ).add_to(folium_map)
-            
-            # 添加航线连线
-            folium.PolyLine(
-                locations=[[A_wgs_lat, A_wgs_lng], [B_wgs_lat, B_wgs_lng]],
-                color='cyan',
-                weight=4,
-                opacity=0.8
-            ).add_to(folium_map)
-            
-            # 添加已保存的障碍物多边形
-            geojson_data = st.session_state.obstacle_geojson
-            if geojson_data and geojson_data.get("features"):
-                folium.GeoJson(
-                    geojson_data,
-                    name='障碍物区域',
-                    style_function=lambda x: {'color': 'orange', 'weight': 3, 'fillOpacity': 0.3}
-                ).add_to(folium_map)
+            # 加载已保存的障碍物多边形
+            if st.session_state.obstacle_geojson.get("features"):
+                folium.GeoJson(st.session_state.obstacle_geojson, name='障碍物', style_function=lambda x: {'color': 'orange', 'weight': 3, 'fillOpacity': 0.3}).add_to(folium_map)
             
             # 显示地图并获取绘制结果
-            output = st_folium(
-                folium_map,
-                width=800,
-                height=600,
-                returned_objects=["last_active_drawing", "all_drawings"]
-            )
+            output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing", "all_drawings"])
             
-            # 处理用户新绘制的多边形
-            if output and "last_active_drawing" in output and output["last_active_drawing"]:
+            # 处理新绘制的多边形
+            if output and output.get("last_active_drawing"):
                 drawing = output["last_active_drawing"]
                 if drawing and drawing.get("geometry") and drawing["geometry"]["type"] == "Polygon":
-                    # 将新绘制的多边形添加到 session_state 的 geojson 中
                     new_feature = {
                         "type": "Feature",
                         "geometry": drawing["geometry"],
-                        "properties": {
-                            "name": f"障碍物_{len(st.session_state.obstacle_geojson['features'])+1}",
-                            "created": datetime.now().isoformat()
-                        }
+                        "properties": {"name": f"障碍物_{len(st.session_state.obstacle_geojson['features'])+1}", "created": datetime.now().isoformat()}
                     }
                     st.session_state.obstacle_geojson["features"].append(new_feature)
-                    # 可选：自动保存
-                    # save_obstacles(st.session_state.obstacle_geojson)
+                    save_obstacles(st.session_state.obstacle_geojson)  # 自动保存
                     st.success("已添加新障碍物多边形")
                     st.rerun()
     
-    # ==================== 飞行监控页面 ====================
     elif page == "📡 飞行监控 (心跳监测)":
         st.header("📡 无人机心跳监测 · 实时数据")
         init_heartbeat()
@@ -325,27 +284,27 @@ def main():
             col1.metric("💓 最新心跳序号", "无")
             col2.metric("⏱️ 最新心跳时间", "无")
         
-        _, status_msg = heartbeat_status()
-        if "超时" in status_msg:
-            st.error(status_msg)
-        elif "等待" in status_msg:
-            st.info(status_msg)
+        _, msg = heartbeat_status()
+        if "超时" in msg:
+            st.error(msg)
+        elif "等待" in msg:
+            st.info(msg)
         else:
-            st.success(status_msg)
+            st.success(msg)
         
         if len(st.session_state.heartbeat_list) >= 2:
             df = pd.DataFrame(st.session_state.heartbeat_list, columns=["序号", "时间", "dt"])
-            fig = px.line(df, x="时间", y="序号", title="📈 心跳序号变化趋势", markers=True)
+            fig = px.line(df, x="时间", y="序号", title="📈 心跳序号趋势", markers=True)
             fig.update_layout(height=400)
             st.plotly_chart(fig, use_container_width=True)
         elif len(st.session_state.heartbeat_list) == 1:
-            st.info("📊 已收到 1 个心跳包，继续接收后将显示趋势图")
+            st.info("已收到1个心跳，继续接收后将显示趋势图")
         else:
-            st.info("📊 等待无人机心跳数据...")
+            st.info("等待心跳数据...")
         
         if st.session_state.heartbeat_list:
-            df_table = pd.DataFrame(st.session_state.heartbeat_list[-10:], columns=["序号", "时间", "dt"])
-            st.dataframe(df_table.drop(columns=["dt"]), use_container_width=True)
+            df_tab = pd.DataFrame(st.session_state.heartbeat_list[-10:], columns=["序号", "时间", "dt"])
+            st.dataframe(df_tab.drop(columns=["dt"]), use_container_width=True)
         else:
             st.info("暂无心跳记录")
         
