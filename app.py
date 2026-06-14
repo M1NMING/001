@@ -78,23 +78,19 @@ def heartbeat_status():
     else:
         return diff, f"✅ 连接正常，最后心跳: {diff:.1f} 秒前"
 
-# ==================== 障碍物数据结构与持久化（修复版）====================
+# ==================== 障碍物数据结构与持久化 ====================
 CONFIG_FILE = "obstacle_config.json"
 
 def normalize_obstacle(obs):
-    """确保每个障碍物都有 'polygon' 和 'height' 字段，兼容旧数据"""
     if isinstance(obs, list):
-        # 旧格式：直接是坐标列表，转换为标准格式
         return {"polygon": obs, "height": 10.0}
     if isinstance(obs, dict):
         if "polygon" not in obs:
-            # 可能只有坐标，尝试从 'coordinates' 或直接第一个键取值
             if "coordinates" in obs:
-                return {"polygon": obs["coordinates"], "height": obs.get("height", 10.0)}
+                return {"polygon": obs["coordinates"], "height": float(obs.get("height", 10.0))}
             else:
-                # 未知格式，返回默认
                 return {"polygon": [], "height": 10.0}
-        return {"polygon": obs["polygon"], "height": obs.get("height", 10.0)}
+        return {"polygon": obs["polygon"], "height": float(obs.get("height", 10.0))}
     return {"polygon": [], "height": 10.0}
 
 def load_obstacles():
@@ -111,20 +107,15 @@ def load_obstacles():
     return []
 
 def save_obstacles(obstacles):
-    # 保存前标准化，确保格式正确
     to_save = []
     for obs in obstacles:
         if isinstance(obs, dict) and "polygon" in obs:
-            to_save.append({"polygon": obs["polygon"], "height": obs.get("height", 10.0)})
-        else:
-            # 跳过无效数据
-            continue
+            to_save.append({"polygon": obs["polygon"], "height": float(obs.get("height", 10.0))})
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(to_save, f, ensure_ascii=False, indent=2)
 
 # ==================== 航线规划算法 ====================
 def line_intersects_polygon(A, B, polygon):
-    """线段AB是否与多边形相交或包含"""
     if not polygon or len(polygon) < 3:
         return False
     line = LineString([A, B])
@@ -132,7 +123,6 @@ def line_intersects_polygon(A, B, polygon):
     return line.intersects(poly)
 
 def get_parallel_line(A, B, offset_meters, direction='left'):
-    """返回平行于AB、偏移offset_meters的线段端点 (lng, lat)"""
     dx = B[0] - A[0]
     dy = B[1] - A[1]
     length = math.hypot(dx, dy)
@@ -155,9 +145,6 @@ def get_parallel_line(A, B, offset_meters, direction='left'):
     return A_new, B_new
 
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius=5):
-    """
-    核心航线规划，包含飞跃/绕行逻辑
-    """
     if not obstacles:
         return [A, B]
     path = [A]
@@ -170,9 +157,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius=5):
         height = obs.get("height", 10.0)
         if line_intersects_polygon(current, B, poly):
             if flight_height > height:
-                # 飞跃，航线不变
                 continue
-            # 需要绕行
             left_A, left_B = get_parallel_line(current, B, safe_radius*2, 'left')
             right_A, right_B = get_parallel_line(current, B, safe_radius*2, 'right')
             if strategy == "向左绕行":
@@ -196,7 +181,6 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius=5):
             path.append(offset_B)
             current = offset_B
     path.append(B)
-    # 简化路径（去除共线点）
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
@@ -217,7 +201,6 @@ def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, saf
     ).add_to(m)
     folium.TileLayer('OpenStreetMap', name='街道图').add_to(m)
     folium.LayerControl().add_to(m)
-    # 绘制障碍物
     for obs in obstacles:
         coords = obs.get("polygon", [])
         if coords and len(coords) >= 3:
@@ -229,14 +212,11 @@ def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, saf
                 fillOpacity=0.3,
                 popup=f'障碍物高度: {height} m'
             ).add_to(m)
-    # 起点终点
     folium.Marker(A_wgs, popup="起点 A", icon=folium.Icon(color='green', icon='play', prefix='fa')).add_to(m)
     folium.Marker(B_wgs, popup="终点 B", icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')).add_to(m)
-    # 规划航线
     if flight_path and len(flight_path) > 1:
         path_latlng = [(lat, lng) for lng, lat in flight_path]
         folium.PolyLine(path_latlng, color='cyan', weight=4, opacity=0.8, tooltip='规划航线').add_to(m)
-    # 绘制控件
     draw = plugins.Draw(
         draw_options={'polygon': True, 'polyline': False, 'rectangle': False, 'circle': False, 'marker': False},
         edit_options={'edit': True, 'remove': True}
@@ -269,17 +249,15 @@ def main():
         st.session_state.B_lat_gcj = 32.2344
         st.session_state.B_lng_gcj = 118.7490
     if "flight_height" not in st.session_state:
-        st.session_state.flight_height = 50
+        st.session_state.flight_height = 50.0
     if "safe_radius" not in st.session_state:
         st.session_state.safe_radius = 5.0
     if "bypass_strategy" not in st.session_state:
         st.session_state.bypass_strategy = "最佳航线"
     
-    # 加载并标准化障碍物
     if "obstacles" not in st.session_state:
         st.session_state.obstacles = load_obstacles()
     else:
-        # 确保现有数据格式正确
         st.session_state.obstacles = [normalize_obstacle(obs) for obs in st.session_state.obstacles]
     
     if page == "🗺️ 航线规划 (智能避障)":
@@ -291,12 +269,12 @@ def main():
             # 起点 A
             st.markdown("#### 🚁 起点 A")
             if coord_sys == "GCJ-02 (高德/百度)":
-                a_lat = st.number_input("纬度 (A)", value=st.session_state.A_lat_gcj, format="%.6f", key="a_lat")
-                a_lng = st.number_input("经度 (A)", value=st.session_state.A_lng_gcj, format="%.6f", key="a_lng")
+                a_lat = st.number_input("纬度 (A)", value=float(st.session_state.A_lat_gcj), format="%.6f", key="a_lat")
+                a_lng = st.number_input("经度 (A)", value=float(st.session_state.A_lng_gcj), format="%.6f", key="a_lng")
             else:
                 wgs_lng, wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
-                a_lat = st.number_input("纬度 (A)", value=wgs_lat, format="%.6f", key="a_lat_wgs")
-                a_lng = st.number_input("经度 (A)", value=wgs_lng, format="%.6f", key="a_lng_wgs")
+                a_lat = st.number_input("纬度 (A)", value=float(wgs_lat), format="%.6f", key="a_lat_wgs")
+                a_lng = st.number_input("经度 (A)", value=float(wgs_lng), format="%.6f", key="a_lng_wgs")
             if st.button("✅ 设置 A 点"):
                 if coord_sys == "GCJ-02 (高德/百度)":
                     st.session_state.A_lat_gcj = a_lat
@@ -311,12 +289,12 @@ def main():
             # 终点 B
             st.markdown("#### 📍 终点 B")
             if coord_sys == "GCJ-02 (高德/百度)":
-                b_lat = st.number_input("纬度 (B)", value=st.session_state.B_lat_gcj, format="%.6f", key="b_lat")
-                b_lng = st.number_input("经度 (B)", value=st.session_state.B_lng_gcj, format="%.6f", key="b_lng")
+                b_lat = st.number_input("纬度 (B)", value=float(st.session_state.B_lat_gcj), format="%.6f", key="b_lat")
+                b_lng = st.number_input("经度 (B)", value=float(st.session_state.B_lng_gcj), format="%.6f", key="b_lng")
             else:
                 wgs_lng, wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
-                b_lat = st.number_input("纬度 (B)", value=wgs_lat, format="%.6f", key="b_lat_wgs")
-                b_lng = st.number_input("经度 (B)", value=wgs_lng, format="%.6f", key="b_lng_wgs")
+                b_lat = st.number_input("纬度 (B)", value=float(wgs_lat), format="%.6f", key="b_lat_wgs")
+                b_lng = st.number_input("经度 (B)", value=float(wgs_lng), format="%.6f", key="b_lng_wgs")
             if st.button("✅ 设置 B 点"):
                 if coord_sys == "GCJ-02 (高德/百度)":
                     st.session_state.B_lat_gcj = b_lat
@@ -330,9 +308,9 @@ def main():
             
             # 飞行参数
             st.markdown("#### ✈️ 飞行参数")
-            flight_h = st.number_input("飞行高度 (m)", value=st.session_state.flight_height, step=5, min_value=0)
+            flight_h = st.number_input("飞行高度 (m)", value=float(st.session_state.flight_height), step=5.0, min_value=0.0)
             st.session_state.flight_height = flight_h
-            safe_r = st.number_input("安全半径 (m)", value=st.session_state.safe_radius, step=1.0, min_value=0.0)
+            safe_r = st.number_input("安全半径 (m)", value=float(st.session_state.safe_radius), step=1.0, min_value=0.0)
             st.session_state.safe_radius = safe_r
             strategy = st.selectbox("绕行策略", ["向左绕行", "向右绕行", "最佳航线"], index=["向左绕行","向右绕行","最佳航线"].index(st.session_state.bypass_strategy))
             st.session_state.bypass_strategy = strategy
@@ -345,8 +323,8 @@ def main():
                 if not poly:
                     continue
                 with st.expander(f"障碍物 {i+1} (高度 {obs.get('height',10)}m)", expanded=False):
-                    new_height = st.number_input(f"高度(m)", value=obs.get("height",10), step=1, key=f"height_{i}")
-                    if new_height != obs.get("height",10):
+                    new_height = st.number_input(f"高度(m)", value=float(obs.get("height", 10.0)), step=1.0, key=f"height_{i}")
+                    if new_height != obs.get("height", 10.0):
                         obs["height"] = new_height
                         save_obstacles(st.session_state.obstacles)
                     if st.button(f"删除", key=f"del_{i}"):
@@ -371,48 +349,38 @@ def main():
                     st.success("已清除")
                     st.rerun()
             
-            # 下载配置文件
             obstacle_json_str = json.dumps(st.session_state.obstacles, ensure_ascii=False, indent=2)
             st.download_button("📥 下载 obstacle_config.json", data=obstacle_json_str, file_name="obstacle_config.json", mime="application/json")
             st.caption(f"当前障碍物数量: {len(st.session_state.obstacles)}")
         
-        # 左侧地图
         with left_col:
             st.markdown("### 🗺️ 卫星实况地图 (可绘制多边形)")
-            # 坐标转换
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
             center_lat = (A_wgs_lat + B_wgs_lat) / 2
             center_lng = (A_wgs_lng + B_wgs_lng) / 2
             
-            # 规划航线
             A_point = (A_wgs_lng, A_wgs_lat)
             B_point = (B_wgs_lng, B_wgs_lat)
             path = compute_avoidance_path(A_point, B_point, st.session_state.obstacles, st.session_state.flight_height, st.session_state.safe_radius)
             
-            # 创建地图
             folium_map = create_map(center_lat, center_lng, st.session_state.obstacles, (A_wgs_lat, A_wgs_lng), (B_wgs_lat, B_wgs_lng), path, st.session_state.safe_radius)
-            
-            # 显示地图并获取绘制结果
             output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing"], key="folium_map")
             
-            # 处理新绘制的多边形
             if output and output.get("last_active_drawing"):
                 drawing = output["last_active_drawing"]
                 if drawing and drawing.get("geometry") and drawing["geometry"]["type"] == "Polygon":
                     coords = drawing["geometry"]["coordinates"][0]
                     new_polygon = [[p[0], p[1]] for p in coords]
-                    # 检查是否已存在
                     exists = any(obs.get("polygon") == new_polygon for obs in st.session_state.obstacles)
                     if not exists:
                         st.session_state["pending_polygon"] = new_polygon
                         st.rerun()
         
-        # 处理待设置高度的多边形（弹出窗口）
         if "pending_polygon" in st.session_state:
             with st.form(key="height_form"):
                 st.warning("请为新绘制的障碍物设置高度")
-                new_height = st.number_input("障碍物高度 (米)", min_value=0, value=20, step=5)
+                new_height = st.number_input("障碍物高度 (米)", min_value=0.0, value=20.0, step=1.0)
                 submitted = st.form_submit_button("确认添加")
                 if submitted:
                     new_obs = {"polygon": st.session_state.pending_polygon, "height": new_height}
