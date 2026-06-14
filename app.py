@@ -78,48 +78,73 @@ def heartbeat_status():
     else:
         return diff, f"✅ 连接正常，最后心跳: {diff:.1f} 秒前"
 
-# ==================== 障碍物数据结构 ====================
-# 每个障碍物: { "polygon": [[lng,lat],...], "height": 20.0 }
+# ==================== 障碍物数据结构与持久化（修复版）====================
 CONFIG_FILE = "obstacle_config.json"
+
+def normalize_obstacle(obs):
+    """确保每个障碍物都有 'polygon' 和 'height' 字段，兼容旧数据"""
+    if isinstance(obs, list):
+        # 旧格式：直接是坐标列表，转换为标准格式
+        return {"polygon": obs, "height": 10.0}
+    if isinstance(obs, dict):
+        if "polygon" not in obs:
+            # 可能只有坐标，尝试从 'coordinates' 或直接第一个键取值
+            if "coordinates" in obs:
+                return {"polygon": obs["coordinates"], "height": obs.get("height", 10.0)}
+            else:
+                # 未知格式，返回默认
+                return {"polygon": [], "height": 10.0}
+        return {"polygon": obs["polygon"], "height": obs.get("height", 10.0)}
+    return {"polygon": [], "height": 10.0}
 
 def load_obstacles():
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return [normalize_obstacle(obs) for obs in data]
+                else:
+                    return []
+        except:
+            return []
     return []
 
 def save_obstacles(obstacles):
+    # 保存前标准化，确保格式正确
+    to_save = []
+    for obs in obstacles:
+        if isinstance(obs, dict) and "polygon" in obs:
+            to_save.append({"polygon": obs["polygon"], "height": obs.get("height", 10.0)})
+        else:
+            # 跳过无效数据
+            continue
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(obstacles, f, ensure_ascii=False, indent=2)
+        json.dump(to_save, f, ensure_ascii=False, indent=2)
 
 # ==================== 航线规划算法 ====================
 def line_intersects_polygon(A, B, polygon):
     """线段AB是否与多边形相交或包含"""
+    if not polygon or len(polygon) < 3:
+        return False
     line = LineString([A, B])
     poly = Polygon(polygon)
     return line.intersects(poly)
 
 def get_parallel_line(A, B, offset_meters, direction='left'):
-    """
-    返回平行于AB、偏移offset_meters的线段端点 (lng, lat)
-    direction: 'left' 或 'right'
-    """
-    # 计算偏移方向（垂直于AB）
+    """返回平行于AB、偏移offset_meters的线段端点 (lng, lat)"""
     dx = B[0] - A[0]
     dy = B[1] - A[1]
     length = math.hypot(dx, dy)
     if length == 0:
         return A, B
-    # 单位向量
     ux = dx / length
     uy = dy / length
-    # 垂直向量 (左转为正)
     perp_x = -uy
     perp_y = ux
     if direction == 'right':
         perp_x = -perp_x
         perp_y = -perp_y
-    # 米转度 (近似)
     lat_rad = math.radians((A[1] + B[1]) / 2)
     meter_per_deg_lon = 111320 * math.cos(lat_rad)
     meter_per_deg_lat = 110540
@@ -131,36 +156,33 @@ def get_parallel_line(A, B, offset_meters, direction='left'):
 
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius=5):
     """
-    核心航线规划：
-    - 对于每个障碍物，检查直线段是否经过
-    - 若经过，比较飞行高度与障碍物高度：飞行高度高则飞跃（直线不变），否则绕行
-    - 绕行策略：根据用户选择，生成偏移路径（左/右/最佳）
-    返回路径点列表（包括起点和终点）
+    核心航线规划，包含飞跃/绕行逻辑
     """
+    if not obstacles:
+        return [A, B]
     path = [A]
     current = A
     strategy = st.session_state.get("bypass_strategy", "最佳航线")
     for obs in obstacles:
-        poly = obs["polygon"]
-        height = obs["height"]
-        # 检查当前点到终点的直线是否与多边形相交
+        poly = obs.get("polygon", [])
+        if not poly or len(poly) < 3:
+            continue
+        height = obs.get("height", 10.0)
         if line_intersects_polygon(current, B, poly):
             if flight_height > height:
-                # 飞跃，不需要绕行
+                # 飞跃，航线不变
                 continue
             # 需要绕行
-            # 计算左右偏移后的线段
             left_A, left_B = get_parallel_line(current, B, safe_radius*2, 'left')
             right_A, right_B = get_parallel_line(current, B, safe_radius*2, 'right')
             if strategy == "向左绕行":
                 offset_A, offset_B = left_A, left_B
             elif strategy == "向右绕行":
                 offset_A, offset_B = right_A, right_B
-            else:  # 最佳航线：选择不与任何障碍物相交且路径较短的
-                left_intersects = any(line_intersects_polygon(left_A, left_B, o["polygon"]) for o in obstacles)
-                right_intersects = any(line_intersects_polygon(right_A, right_B, o["polygon"]) for o in obstacles)
+            else:  # 最佳航线
+                left_intersects = any(line_intersects_polygon(left_A, left_B, o.get("polygon", [])) for o in obstacles)
+                right_intersects = any(line_intersects_polygon(right_A, right_B, o.get("polygon", [])) for o in obstacles)
                 if not left_intersects and not right_intersects:
-                    # 都可行，比较长度（取短的）
                     left_len = math.hypot(left_A[0]-left_B[0], left_A[1]-left_B[1])
                     right_len = math.hypot(right_A[0]-right_B[0], right_A[1]-right_B[1])
                     offset_A, offset_B = (left_A, left_B) if left_len < right_len else (right_A, right_B)
@@ -169,17 +191,14 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius=5):
                 elif not right_intersects:
                     offset_A, offset_B = right_A, right_B
                 else:
-                    # 都相交，默认向左
                     offset_A, offset_B = left_A, left_B
-            # 添加绕行点（起点偏移后的线段起点和终点）
             path.append(offset_A)
             path.append(offset_B)
             current = offset_B
     path.append(B)
-    # 简化路径（可选：去除共线点）
+    # 简化路径（去除共线点）
     simplified = [path[0]]
     for i in range(1, len(path)-1):
-        # 如果三点共线，跳过中间点
         p1 = simplified[-1]
         p2 = path[i]
         p3 = path[i+1]
@@ -198,17 +217,18 @@ def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, saf
     ).add_to(m)
     folium.TileLayer('OpenStreetMap', name='街道图').add_to(m)
     folium.LayerControl().add_to(m)
-    # 障碍物多边形
+    # 绘制障碍物
     for obs in obstacles:
-        coords = obs["polygon"]
-        height = obs["height"]
-        folium.Polygon(
-            locations=[[lat, lng] for lng, lat in coords],
-            color='orange',
-            weight=3,
-            fillOpacity=0.3,
-            popup=f'障碍物高度: {height} m'
-        ).add_to(m)
+        coords = obs.get("polygon", [])
+        if coords and len(coords) >= 3:
+            height = obs.get("height", 10.0)
+            folium.Polygon(
+                locations=[[lat, lng] for lng, lat in coords],
+                color='orange',
+                weight=3,
+                fillOpacity=0.3,
+                popup=f'障碍物高度: {height} m'
+            ).add_to(m)
     # 起点终点
     folium.Marker(A_wgs, popup="起点 A", icon=folium.Icon(color='green', icon='play', prefix='fa')).add_to(m)
     folium.Marker(B_wgs, popup="终点 B", icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')).add_to(m)
@@ -255,9 +275,12 @@ def main():
     if "bypass_strategy" not in st.session_state:
         st.session_state.bypass_strategy = "最佳航线"
     
-    # 障碍物列表
+    # 加载并标准化障碍物
     if "obstacles" not in st.session_state:
         st.session_state.obstacles = load_obstacles()
+    else:
+        # 确保现有数据格式正确
+        st.session_state.obstacles = [normalize_obstacle(obs) for obs in st.session_state.obstacles]
     
     if page == "🗺️ 航线规划 (智能避障)":
         left_col, right_col = st.columns([7, 3])
@@ -318,6 +341,9 @@ def main():
             st.markdown("#### 🧱 障碍物管理")
             # 显示现有障碍物
             for i, obs in enumerate(st.session_state.obstacles):
+                poly = obs.get("polygon", [])
+                if not poly:
+                    continue
                 with st.expander(f"障碍物 {i+1} (高度 {obs.get('height',10)}m)", expanded=False):
                     new_height = st.number_input(f"高度(m)", value=obs.get("height",10), step=1, key=f"height_{i}")
                     if new_height != obs.get("height",10):
@@ -377,7 +403,7 @@ def main():
                     coords = drawing["geometry"]["coordinates"][0]
                     new_polygon = [[p[0], p[1]] for p in coords]
                     # 检查是否已存在
-                    exists = any(obs["polygon"] == new_polygon for obs in st.session_state.obstacles)
+                    exists = any(obs.get("polygon") == new_polygon for obs in st.session_state.obstacles)
                     if not exists:
                         st.session_state["pending_polygon"] = new_polygon
                         st.rerun()
