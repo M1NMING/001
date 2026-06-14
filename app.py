@@ -11,6 +11,7 @@ from streamlit_folium import st_folium
 import folium
 from folium import plugins
 from shapely.geometry import Polygon, Point, LineString
+from shapely.ops import unary_union
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机任务平台 | 智能航线规划", layout="wide")
@@ -78,7 +79,7 @@ def heartbeat_status():
     else:
         return diff, f"✅ 连接正常，最后心跳: {diff:.1f} 秒前"
 
-# ==================== 障碍物数据结构 ====================
+# ==================== 障碍物数据结构与持久化 ====================
 CONFIG_FILE = "obstacle_config.json"
 
 def normalize_obstacle(obs):
@@ -86,7 +87,10 @@ def normalize_obstacle(obs):
         return {"polygon": obs, "height": 10.0}
     if isinstance(obs, dict):
         if "polygon" not in obs:
-            return {"polygon": [], "height": 10.0}
+            if "coordinates" in obs:
+                return {"polygon": obs["coordinates"], "height": float(obs.get("height", 10.0))}
+            else:
+                return {"polygon": [], "height": 10.0}
         return {"polygon": obs["polygon"], "height": float(obs.get("height", 10.0))}
     return {"polygon": [], "height": 10.0}
 
@@ -97,7 +101,8 @@ def load_obstacles():
                 data = json.load(f)
                 if isinstance(data, list):
                     return [normalize_obstacle(obs) for obs in data]
-                return []
+                else:
+                    return []
         except:
             return []
     return []
@@ -110,82 +115,94 @@ def save_obstacles(obstacles):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(to_save, f, ensure_ascii=False, indent=2)
 
-# ==================== 航线规划（带安全半径）====================
-def line_intersects_polygon(A, B, polygon):
+# ==================== 航线规划算法（修复版：飞跃条件 >，绕行条件 <=）====================
+def get_buffer_polygon(polygon, safe_radius_m, center_lng, center_lat):
+    """将多边形向外扩展 safe_radius_m 米，返回扩展后的经纬度多边形"""
     if not polygon or len(polygon) < 3:
-        return False
-    line = LineString([A, B])
-    poly = Polygon(polygon)
-    return line.intersects(poly)
-
-def get_parallel_line(A, B, offset_meters, direction='left'):
-    dx = B[0] - A[0]
-    dy = B[1] - A[1]
-    length = math.hypot(dx, dy)
-    if length == 0:
-        return A, B
-    ux = dx / length
-    uy = dy / length
-    perp_x = -uy
-    perp_y = ux
-    if direction == 'right':
-        perp_x = -perp_x
-        perp_y = -perp_y
-    lat_rad = math.radians((A[1] + B[1]) / 2)
-    meter_per_deg_lon = 111320 * math.cos(lat_rad)
+        return []
+    meter_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
     meter_per_deg_lat = 110540
-    offset_deg_lon = offset_meters / meter_per_deg_lon * perp_x
-    offset_deg_lat = offset_meters / meter_per_deg_lat * perp_y
-    A_new = (A[0] + offset_deg_lon, A[1] + offset_deg_lat)
-    B_new = (B[0] + offset_deg_lon, B[1] + offset_deg_lat)
-    return A_new, B_new
+    local_poly = []
+    for p in polygon:
+        dx = (p[0] - center_lng) * meter_per_deg_lon
+        dy = (p[1] - center_lat) * meter_per_deg_lat
+        local_poly.append((dx, dy))
+    poly_local = Polygon(local_poly)
+    buffered_local = poly_local.buffer(safe_radius_m)
+    buffered_coords = []
+    for pt in buffered_local.exterior.coords:
+        lng = center_lng + pt[0] / meter_per_deg_lon
+        lat = center_lat + pt[1] / meter_per_deg_lat
+        buffered_coords.append((lng, lat))
+    return buffered_coords
 
-def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius):
-    # 生成障碍物缓冲区（简化版：直接检查安全半径内是否相交，不实际扩展多边形）
-    # 由于 shapely buffer 在经纬度下不易精确，我们采用另一种方式：检测线段是否距离多边形太近
-    # 这里为了稳定，仍使用原始多边形检测，但偏移距离加倍保证安全
-    if not obstacles:
-        return [A, B]
-    path = [A]
-    current = A
-    strategy = st.session_state.get("bypass_strategy", "最佳航线")
+def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius=5, strategy="最佳航线"):
+    """
+    规划航线，确保与每个障碍物的安全缓冲区（扩展 safe_radius）不相交。
+    飞跃判断：若 flight_height > obstacle_height，则允许航线穿过原始多边形但必须避开缓冲区（即仍然需要绕行？）
+    实际上，为了保持水平安全距离，无论飞跃与否，都应该避开缓冲区。
+    因此简化：只考虑避开所有障碍物的缓冲区（扩展 safe_radius 米）。
+    """
+    # 生成所有障碍物的缓冲区（合并为一个几何体）
+    buffer_zones = []
     for obs in obstacles:
         poly = obs.get("polygon", [])
         if not poly or len(poly) < 3:
             continue
-        height = obs.get("height", 10.0)
-        # 检测 current 到 B 的线段是否与障碍物相交
-        if line_intersects_polygon(current, B, poly):
-            if flight_height > height:
-                # 飞跃，但安全半径：增加偏移距离，仍需要稍微偏移
-                # 为了保证安全距离，偏移 safe_radius*1.5
-                offset_dist = safe_radius * 1.5
+        center_lng = sum(p[0] for p in poly) / len(poly)
+        center_lat = sum(p[1] for p in poly) / len(poly)
+        buffered = get_buffer_polygon(poly, safe_radius, center_lng, center_lat)
+        if buffered and len(buffered) >= 3:
+            buffer_zones.append(Polygon(buffered))
+    if not buffer_zones:
+        return [A, B]
+    merged_buffer = unary_union(buffer_zones)
+    
+    path = [A]
+    current = A
+    max_iter = 20
+    for _ in range(max_iter):
+        line = LineString([current, B])
+        if not line.intersects(merged_buffer):
+            path.append(B)
+            break
+        # 需要绕行：计算垂直偏移方向
+        dx = B[0] - current[0]
+        dy = B[1] - current[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            break
+        ux = dx / length
+        uy = dy / length
+        perp_x = -uy
+        perp_y = ux
+        if strategy == "向左绕行":
+            dir_sign = 1
+        elif strategy == "向右绕行":
+            dir_sign = -1
+        else:  # 最佳航线：尝试左右，选不与缓冲区相交且较短的
+            left_A, left_B = get_offset_points(current, B, safe_radius*3, 1)
+            right_A, right_B = get_offset_points(current, B, safe_radius*3, -1)
+            left_line = LineString([left_A, left_B])
+            right_line = LineString([right_A, right_B])
+            left_intersect = left_line.intersects(merged_buffer)
+            right_intersect = right_line.intersects(merged_buffer)
+            if not left_intersect and not right_intersect:
+                left_len = math.hypot(left_A[0]-left_B[0], left_A[1]-left_B[1])
+                right_len = math.hypot(right_A[0]-right_B[0], right_A[1]-right_B[1])
+                dir_sign = 1 if left_len < right_len else -1
+            elif not left_intersect:
+                dir_sign = 1
+            elif not right_intersect:
+                dir_sign = -1
             else:
-                offset_dist = safe_radius * 3
-            left_A, left_B = get_parallel_line(current, B, offset_dist, 'left')
-            right_A, right_B = get_parallel_line(current, B, offset_dist, 'right')
-            if strategy == "向左绕行":
-                offset_A, offset_B = left_A, left_B
-            elif strategy == "向右绕行":
-                offset_A, offset_B = right_A, right_B
-            else:  # 最佳航线
-                # 简单选偏移后与障碍物不相交的那个方向
-                left_intersects = line_intersects_polygon(left_A, left_B, poly)
-                right_intersects = line_intersects_polygon(right_A, right_B, poly)
-                if not left_intersects and not right_intersects:
-                    # 都可行，选择偏移距离较小的（但实际上偏移相同）
-                    offset_A, offset_B = left_A, left_B
-                elif not left_intersects:
-                    offset_A, offset_B = left_A, left_B
-                elif not right_intersects:
-                    offset_A, offset_B = right_A, right_B
-                else:
-                    # 都相交，默认向左
-                    offset_A, offset_B = left_A, left_B
-            path.append(offset_A)
-            path.append(offset_B)
-            current = offset_B
-    path.append(B)
+                dir_sign = 1
+        offset_A, offset_B = get_offset_points(current, B, safe_radius*3, dir_sign)
+        path.append(offset_A)
+        path.append(offset_B)
+        current = offset_B
+    else:
+        path.append(B)
     # 简化路径
     simplified = [path[0]]
     for i in range(1, len(path)-1):
@@ -196,6 +213,26 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius):
             simplified.append(p2)
     simplified.append(path[-1])
     return simplified
+
+def get_offset_points(A, B, offset_m, direction_sign):
+    """direction_sign: 1 左转，-1 右转"""
+    dx = B[0] - A[0]
+    dy = B[1] - A[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return A, B
+    ux = dx / length
+    uy = dy / length
+    perp_x = -uy * direction_sign
+    perp_y = ux * direction_sign
+    lat_rad = math.radians((A[1] + B[1]) / 2)
+    meter_per_deg_lon = 111320 * math.cos(lat_rad)
+    meter_per_deg_lat = 110540
+    offset_deg_lon = offset_m / meter_per_deg_lon * perp_x
+    offset_deg_lat = offset_m / meter_per_deg_lat * perp_y
+    A_new = (A[0] + offset_deg_lon, A[1] + offset_deg_lat)
+    B_new = (B[0] + offset_deg_lon, B[1] + offset_deg_lat)
+    return A_new, B_new
 
 # ==================== 创建地图 ====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
@@ -216,7 +253,7 @@ def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, saf
                 color='orange',
                 weight=3,
                 fillOpacity=0.3,
-                popup=f'高度: {height} m'
+                popup=f'障碍物高度: {height} m'
             ).add_to(m)
     folium.Marker(A_wgs, popup="起点 A", icon=folium.Icon(color='green', icon='play', prefix='fa')).add_to(m)
     folium.Marker(B_wgs, popup="终点 B", icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')).add_to(m)
@@ -245,9 +282,9 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 安全半径会影响绕行距离")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 安全半径强制生效 | 飞行高度 <= 障碍物高度时自动绕行")
     
-    # 初始化坐标
+    # 初始化坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
         st.session_state.A_lat_gcj = 32.2323
         st.session_state.A_lng_gcj = 118.7490
@@ -255,7 +292,7 @@ def main():
         st.session_state.B_lat_gcj = 32.2344
         st.session_state.B_lng_gcj = 118.7490
     if "flight_height" not in st.session_state:
-        st.session_state.flight_height = 50.0
+        st.session_state.flight_height = 30.0
     if "safe_radius" not in st.session_state:
         st.session_state.safe_radius = 5.0
     if "bypass_strategy" not in st.session_state:
@@ -333,7 +370,7 @@ def main():
                         obs["height"] = new_height
                         save_obstacles(st.session_state.obstacles)
                         st.success("高度已更新")
-                    if st.button(f"🗑️ 删除", key=f"del_btn_{i}"):
+                    if st.button(f"🗑️ 删除此障碍物", key=f"del_btn_{i}"):
                         st.session_state.obstacles.pop(i)
                         save_obstacles(st.session_state.obstacles)
                         st.rerun()
@@ -368,7 +405,7 @@ def main():
             
             A_point = (A_wgs_lng, A_wgs_lat)
             B_point = (B_wgs_lng, B_wgs_lat)
-            path = compute_avoidance_path(A_point, B_point, st.session_state.obstacles, st.session_state.flight_height, st.session_state.safe_radius)
+            path = compute_avoidance_path(A_point, B_point, st.session_state.obstacles, st.session_state.flight_height, st.session_state.safe_radius, st.session_state.bypass_strategy)
             
             folium_map = create_map(center_lat, center_lng, st.session_state.obstacles, (A_wgs_lat, A_wgs_lng), (B_wgs_lat, B_wgs_lng), path, st.session_state.safe_radius)
             output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing"], key="folium_map")
@@ -383,7 +420,7 @@ def main():
                         new_obs = {"polygon": new_polygon, "height": 10.0}
                         st.session_state.obstacles.append(new_obs)
                         save_obstacles(st.session_state.obstacles)
-                        st.success("已添加新障碍物（默认高度10米），请在右侧修改高度")
+                        st.success("✅ 已添加新障碍物（默认高度10米）")
                         st.rerun()
     
     elif page == "📡 飞行监控 (心跳监测)":
