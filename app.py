@@ -114,14 +114,7 @@ def save_obstacles(obstacles):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(to_save, f, ensure_ascii=False, indent=2)
 
-# ==================== 纯几何辅助函数 ====================
-def point_to_polygon_distance(point, polygon):
-    p = Point(point[0], point[1])
-    poly = Polygon(polygon)
-    if p.within(poly):
-        return 0.0
-    return poly.exterior.distance(p)
-
+# ==================== 航线规划算法 ====================
 def line_intersects_polygon(A, B, polygon):
     if not polygon or len(polygon) < 3:
         return False
@@ -148,7 +141,6 @@ def get_offset_points(A, B, offset_meters, direction='left'):
     B_new = (B[0] + offset_lon, B[1] + offset_lat)
     return A_new, B_new
 
-# ==================== 航线规划算法（强制绕行版）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
@@ -166,6 +158,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 any_intersection = True
                 if flight_height > height:
                     continue
+                # 必须绕行
                 offset_m = safe_radius * 3
                 success = False
                 best_A, best_B = None, None
@@ -178,6 +171,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                         dirs = ['left', 'right']
                     for d in dirs:
                         off_A, off_B = get_offset_points(current, B, offset_m, d)
+                        # 检查是否与任何障碍物相交
                         intersect = False
                         for obs2 in obstacles:
                             p2 = obs2.get("polygon", [])
@@ -205,6 +199,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             break
     else:
         path.append(B)
+    # 简化路径
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
@@ -265,13 +260,15 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.info("🗺️ 卫星图源: Esri | 飞行高度 ≤ 障碍物高度时强制绕行")
     
-    # 初始化坐标 (GCJ-02) - 已按用户要求修改
+    # ========== 修改默认坐标为新值 ==========
     if "A_lat_gcj" not in st.session_state:
-        st.session_state.A_lat_gcj = 32.230500   # 新坐标
-        st.session_state.A_lng_gcj = 118.754000  # 新坐标
+        st.session_state.A_lat_gcj = 32.230500   # 新纬度
+        st.session_state.A_lng_gcj = 118.748500 # 新经度
     if "B_lat_gcj" not in st.session_state:
-        st.session_state.B_lat_gcj = 32.238000   # 新坐标
-        st.session_state.B_lng_gcj = 118.754000  # 新坐标
+        st.session_state.B_lat_gcj = 32.238000   # 新纬度
+        st.session_state.B_lng_gcj = 118.754000 # 新经度
+    # ======================================
+    
     if "flight_height" not in st.session_state:
         st.session_state.flight_height = 30.0
     if "safe_radius" not in st.session_state:
