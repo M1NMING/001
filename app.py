@@ -116,7 +116,6 @@ def save_obstacles(obstacles):
 
 # ==================== 纯几何辅助函数 ====================
 def point_to_polygon_distance(point, polygon):
-    """计算点到多边形的最小距离（米）"""
     p = Point(point[0], point[1])
     poly = Polygon(polygon)
     if p.within(poly):
@@ -124,7 +123,6 @@ def point_to_polygon_distance(point, polygon):
     return poly.exterior.distance(p)
 
 def line_intersects_polygon(A, B, polygon):
-    """线段AB是否与多边形相交"""
     if not polygon or len(polygon) < 3:
         return False
     line = LineString([A, B])
@@ -132,7 +130,6 @@ def line_intersects_polygon(A, B, polygon):
     return line.intersects(poly)
 
 def get_offset_points(A, B, offset_meters, direction='left'):
-    """返回平行于AB且偏移 offset_meters 的线段端点"""
     dx = B[0] - A[0]
     dy = B[1] - A[1]
     length = math.hypot(dx, dy)
@@ -153,20 +150,12 @@ def get_offset_points(A, B, offset_meters, direction='left'):
 
 # ==================== 航线规划算法（强制绕行版）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
-    """
-    针对每一个障碍物：
-       - 如果直线 A->B 与该障碍物相交，且飞行高度 <= 障碍物高度，则执行绕行。
-       - 绕行方法：生成偏移线段，偏移距离 = safe_radius * 3。如果偏移后的线段仍与任何障碍物相交，
-         则增加偏移距离（每次增加 safe_radius）直到避开或达到最大尝试次数。
-       - 然后将当前点更新为偏移线段的终点，重复整个过程。
-    """
     if not obstacles:
         return [A, B]
     path = [A]
     current = A
     max_iter = 30
     for _ in range(max_iter):
-        # 检测从 current 到 B 的直线与所有障碍物的相交情况
         any_intersection = False
         for obs in obstacles:
             poly = obs.get("polygon", [])
@@ -176,10 +165,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             if line_intersects_polygon(current, B, poly):
                 any_intersection = True
                 if flight_height > height:
-                    # 飞跃：不处理，继续直线
                     continue
-                # 需要绕行
-                # 尝试偏移，从 safe_radius*3 开始，逐步增加
                 offset_m = safe_radius * 3
                 success = False
                 best_A, best_B = None, None
@@ -188,11 +174,10 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                         dirs = ['left']
                     elif strategy == "向右绕行":
                         dirs = ['right']
-                    else:  # 最佳航线
+                    else:
                         dirs = ['left', 'right']
                     for d in dirs:
                         off_A, off_B = get_offset_points(current, B, offset_m, d)
-                        # 检查偏移后的线段是否与任何障碍物相交（排除当前障碍物本身？为了彻底避开，检查所有）
                         intersect = False
                         for obs2 in obstacles:
                             p2 = obs2.get("polygon", [])
@@ -206,28 +191,25 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                             break
                     if success:
                         break
-                    offset_m += safe_radius  # 增加偏移距离
+                    offset_m += safe_radius
                 if success:
                     path.append(best_A)
                     path.append(best_B)
                     current = best_B
                 else:
-                    # 实在无法避开，直接直线连接并退出（罕见）
                     path.append(B)
                     current = B
-                break  # 跳出障碍物循环，重新从新起点扫描
+                break
         if not any_intersection:
             path.append(B)
             break
     else:
         path.append(B)
-    # 简化路径（去除共线点）
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
         p2 = path[i]
         p3 = path[i+1]
-        # 计算向量叉积，判断是否共线
         if abs((p2[0]-p1[0])*(p3[1]-p2[1]) - (p2[1]-p1[1])*(p3[0]-p2[0])) > 1e-8:
             simplified.append(p2)
     simplified.append(path[-1])
@@ -283,13 +265,13 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.info("🗺️ 卫星图源: Esri | 飞行高度 ≤ 障碍物高度时强制绕行")
     
-    # 初始化坐标 (GCJ-02)
+    # 初始化坐标 (GCJ-02) - 已按用户要求修改
     if "A_lat_gcj" not in st.session_state:
-        st.session_state.A_lat_gcj = 32.2323
-        st.session_state.A_lng_gcj = 118.7490
+        st.session_state.A_lat_gcj = 32.230500   # 新坐标
+        st.session_state.A_lng_gcj = 118.754000  # 新坐标
     if "B_lat_gcj" not in st.session_state:
-        st.session_state.B_lat_gcj = 32.2344
-        st.session_state.B_lng_gcj = 118.7490
+        st.session_state.B_lat_gcj = 32.238000   # 新坐标
+        st.session_state.B_lng_gcj = 118.754000  # 新坐标
     if "flight_height" not in st.session_state:
         st.session_state.flight_height = 30.0
     if "safe_radius" not in st.session_state:
