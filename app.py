@@ -82,6 +82,7 @@ def heartbeat_status():
 CONFIG_FILE = "obstacle_config.json"
 
 def normalize_obstacle(obs):
+    """确保每个障碍物都有 polygon 和 height 字段"""
     if isinstance(obs, list):
         return {"polygon": obs, "height": 10.0}
     if isinstance(obs, dict):
@@ -109,7 +110,7 @@ def load_obstacles():
 def save_obstacles(obstacles):
     to_save = []
     for obs in obstacles:
-        if isinstance(obs, dict) and "polygon" in obs:
+        if isinstance(obs, dict) and "polygon" in obs and obs["polygon"]:
             to_save.append({"polygon": obs["polygon"], "height": float(obs.get("height", 10.0))})
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(to_save, f, ensure_ascii=False, indent=2)
@@ -239,7 +240,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 绘制多边形后可设置高度")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 绘制多边形后自动添加，右侧面板修改高度")
     
     # 初始化坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
@@ -258,6 +259,7 @@ def main():
     if "obstacles" not in st.session_state:
         st.session_state.obstacles = load_obstacles()
     else:
+        # 标准化现有障碍物
         st.session_state.obstacles = [normalize_obstacle(obs) for obs in st.session_state.obstacles]
     
     if page == "🗺️ 航线规划 (智能避障)":
@@ -317,21 +319,24 @@ def main():
             
             st.markdown("---")
             st.markdown("#### 🧱 障碍物管理")
-            # 显示现有障碍物
+            st.caption("点击下方障碍物展开，可修改高度或删除")
+            # 显示现有障碍物列表，每个都可以展开修改高度
             for i, obs in enumerate(st.session_state.obstacles):
                 poly = obs.get("polygon", [])
                 if not poly:
                     continue
-                with st.expander(f"障碍物 {i+1} (高度 {obs.get('height',10)}m)", expanded=False):
-                    new_height = st.number_input(f"高度(m)", value=float(obs.get("height", 10.0)), step=1.0, key=f"height_{i}")
+                with st.expander(f"障碍物 {i+1} (高度 {obs.get('height',10):.1f} m)", expanded=False):
+                    new_height = st.number_input(f"高度 (米)", value=float(obs.get("height", 10.0)), step=1.0, key=f"height_edit_{i}")
                     if new_height != obs.get("height", 10.0):
                         obs["height"] = new_height
                         save_obstacles(st.session_state.obstacles)
-                    if st.button(f"删除", key=f"del_{i}"):
+                        st.success("高度已更新")
+                    if st.button(f"🗑️ 删除此障碍物", key=f"del_btn_{i}"):
                         st.session_state.obstacles.pop(i)
                         save_obstacles(st.session_state.obstacles)
                         st.rerun()
             
+            # 操作按钮
             col_btn1, col_btn2, col_btn3 = st.columns(3)
             with col_btn1:
                 if st.button("💾 保存所有到文件"):
@@ -349,46 +354,47 @@ def main():
                     st.success("已清除")
                     st.rerun()
             
+            # 下载配置文件
             obstacle_json_str = json.dumps(st.session_state.obstacles, ensure_ascii=False, indent=2)
             st.download_button("📥 下载 obstacle_config.json", data=obstacle_json_str, file_name="obstacle_config.json", mime="application/json")
             st.caption(f"当前障碍物数量: {len(st.session_state.obstacles)}")
         
         with left_col:
             st.markdown("### 🗺️ 卫星实况地图 (可绘制多边形)")
+            # 坐标转换
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
             center_lat = (A_wgs_lat + B_wgs_lat) / 2
             center_lng = (A_wgs_lng + B_wgs_lng) / 2
             
+            # 规划航线
             A_point = (A_wgs_lng, A_wgs_lat)
             B_point = (B_wgs_lng, B_wgs_lat)
             path = compute_avoidance_path(A_point, B_point, st.session_state.obstacles, st.session_state.flight_height, st.session_state.safe_radius)
             
+            # 创建地图
             folium_map = create_map(center_lat, center_lng, st.session_state.obstacles, (A_wgs_lat, A_wgs_lng), (B_wgs_lat, B_wgs_lng), path, st.session_state.safe_radius)
             output = st_folium(folium_map, width=800, height=600, returned_objects=["last_active_drawing"], key="folium_map")
             
+            # 处理新绘制的多边形：直接添加到障碍物列表，默认高度10米
             if output and output.get("last_active_drawing"):
                 drawing = output["last_active_drawing"]
                 if drawing and drawing.get("geometry") and drawing["geometry"]["type"] == "Polygon":
                     coords = drawing["geometry"]["coordinates"][0]
-                    new_polygon = [[p[0], p[1]] for p in coords]
-                    exists = any(obs.get("polygon") == new_polygon for obs in st.session_state.obstacles)
+                    new_polygon = [[p[0], p[1]] for p in coords]  # 保持 [lng, lat] 格式
+                    # 检查是否已经存在（避免重复添加）
+                    exists = False
+                    for obs in st.session_state.obstacles:
+                        if obs.get("polygon") == new_polygon:
+                            exists = True
+                            break
                     if not exists:
-                        st.session_state["pending_polygon"] = new_polygon
+                        # 直接添加，默认高度10米
+                        new_obs = {"polygon": new_polygon, "height": 10.0}
+                        st.session_state.obstacles.append(new_obs)
+                        save_obstacles(st.session_state.obstacles)
+                        st.success("✅ 已添加新障碍物（默认高度10米），请在右侧面板修改高度")
                         st.rerun()
-        
-        if "pending_polygon" in st.session_state:
-            with st.form(key="height_form"):
-                st.warning("请为新绘制的障碍物设置高度")
-                new_height = st.number_input("障碍物高度 (米)", min_value=0.0, value=20.0, step=1.0)
-                submitted = st.form_submit_button("确认添加")
-                if submitted:
-                    new_obs = {"polygon": st.session_state.pending_polygon, "height": new_height}
-                    st.session_state.obstacles.append(new_obs)
-                    save_obstacles(st.session_state.obstacles)
-                    del st.session_state["pending_polygon"]
-                    st.success("障碍物已添加")
-                    st.rerun()
     
     elif page == "📡 飞行监控 (心跳监测)":
         st.header("📡 无人机心跳监测 · 实时数据")
