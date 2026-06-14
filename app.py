@@ -210,17 +210,15 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
     simplified.append(path[-1])
     return simplified
 
-# ==================== 创建地图（使用 OpenStreetMap 确保稳定）====================
+# ==================== 创建地图 ====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
     m = folium.Map(location=[center_lat, center_lng], zoom_start=16, control_scale=True)
-    # 使用 OpenStreetMap 作为底图（稳定无需Key）
+    folium.TileLayer(
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Tiles &copy; Esri',
+        name='卫星影像'
+    ).add_to(m)
     folium.TileLayer('OpenStreetMap', name='街道图').add_to(m)
-    # 可选添加 Esri 卫星图层作为备选（若需要可取消注释，但不强依赖）
-    # folium.TileLayer(
-    #     tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    #     attr='Tiles &copy; Esri',
-    #     name='卫星影像'
-    # ).add_to(m)
     folium.LayerControl().add_to(m)
     for obs in obstacles:
         coords = obs.get("polygon", [])
@@ -260,15 +258,17 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 底图: OpenStreetMap (稳定) | 飞行高度 ≤ 障碍物高度时强制绕行")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 飞行高度 ≤ 障碍物高度时强制绕行")
     
-    # 默认坐标
+    # ========== 修改默认坐标为新值 ==========
     if "A_lat_gcj" not in st.session_state:
-        st.session_state.A_lat_gcj = 32.230500
-        st.session_state.A_lng_gcj = 118.748500
+        st.session_state.A_lat_gcj = 32.230500   # 新纬度
+        st.session_state.A_lng_gcj = 118.748500 # 新经度
     if "B_lat_gcj" not in st.session_state:
-        st.session_state.B_lat_gcj = 32.238000
-        st.session_state.B_lng_gcj = 118.754000
+        st.session_state.B_lat_gcj = 32.238000   # 新纬度
+        st.session_state.B_lng_gcj = 118.754000 # 新经度
+    # ======================================
+    
     if "flight_height" not in st.session_state:
         st.session_state.flight_height = 30.0
     if "safe_radius" not in st.session_state:
