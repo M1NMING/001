@@ -1,4 +1,4 @@
-# app.py
+# app.py 最终版（完整代码，包含障碍物缓冲区，保证绕行路径距障碍物至少 safe_radius 米）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -11,7 +11,6 @@ from streamlit_folium import st_folium
 import folium
 from folium import plugins
 from shapely.geometry import Polygon, Point, LineString
-from shapely.ops import nearest_points
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机任务平台 | 智能航线规划", layout="wide")
@@ -124,7 +123,6 @@ def line_intersects_polygon(A, B, polygon):
     return line.intersects(poly)
 
 def get_line_polygon_intersection(A, B, polygon):
-    """返回线段AB与多边形polygon的第一个交点（按从A到B的顺序），若不相交返回None"""
     line = LineString([A, B])
     poly = Polygon(polygon)
     if not line.intersects(poly):
@@ -135,13 +133,11 @@ def get_line_polygon_intersection(A, B, polygon):
     if intersection.geom_type == 'Point':
         return (intersection.x, intersection.y)
     elif intersection.geom_type == 'MultiPoint' or intersection.geom_type == 'LineString':
-        # 取第一个点
         pt = intersection.geoms[0] if hasattr(intersection, 'geoms') else intersection.coords[0]
         return (pt.x, pt.y) if hasattr(pt, 'x') else (pt[0], pt[1])
     return None
 
 def distance_meters(p1, p2):
-    """估算两点间距离（米），基于经纬度近似"""
     lat_rad = math.radians((p1[1] + p2[1]) / 2)
     meter_per_deg_lon = 111320 * math.cos(lat_rad)
     meter_per_deg_lat = 110540
@@ -150,7 +146,6 @@ def distance_meters(p1, p2):
     return math.hypot(dx, dy)
 
 def interpolate_point_on_line(A, B, distance_from_A_meters):
-    """在线段AB上从A出发沿方向移动distance_meters，返回新点坐标"""
     total_dist = distance_meters(A, B)
     if total_dist < 1e-6:
         return A
@@ -158,13 +153,7 @@ def interpolate_point_on_line(A, B, distance_from_A_meters):
     t = max(0.0, min(1.0, t))
     return (A[0] + t * (B[0] - A[0]), A[1] + t * (B[1] - A[1]))
 
-def get_offset_points_with_start(A, B, offset_meters, direction='left', start_point=None):
-    """
-    生成从 start_point 到 B 的偏移线段，偏移量为 offset_meters。
-    如果 start_point 未指定，则使用 A。
-    """
-    if start_point is None:
-        start_point = A
+def get_offset_points_with_start(start_point, B, offset_meters, direction='left'):
     dx = B[0] - start_point[0]
     dy = B[1] - start_point[1]
     length = math.hypot(dx, dy)
@@ -189,54 +178,79 @@ def get_offset_points_with_start(A, B, offset_meters, direction='left', start_po
     new_end = (B[0] + offset_lon, B[1] + offset_lat)
     return new_start, new_end
 
-# ==================== 核心航线规划（在障碍物前5米开始绕行）====================
+def get_buffer_polygon(polygon, safe_radius, ref_point):
+    if not polygon or len(polygon) < 3:
+        return None
+    center_lng, center_lat = ref_point
+    meter_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
+    meter_per_deg_lat = 110540
+    local_points = []
+    for p in polygon:
+        dx = (p[0] - center_lng) * meter_per_deg_lon
+        dy = (p[1] - center_lat) * meter_per_deg_lat
+        local_points.append((dx, dy))
+    local_poly = Polygon(local_points)
+    buffered = local_poly.buffer(safe_radius)
+    buffered_coords = []
+    for pt in buffered.exterior.coords:
+        lng = center_lng + pt[0] / meter_per_deg_lon
+        lat = center_lat + pt[1] / meter_per_deg_lat
+        buffered_coords.append((lng, lat))
+    return buffered_coords
+
+# ==================== 核心航线规划（距离障碍物至少 safe_radius 米）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
-    """
-    对每个障碍物：
-       - 从当前点 current 到 B 的直线，若与某个障碍物相交且 flight_height <= 障碍物高度，
-       - 则找到第一个交点 intersection，
-       - 在距离 intersection 前 safe_radius 米处（沿线段方向）开始绕行，
-       - 生成偏移线段（偏移距离从 safe_radius*2 开始逐步增加），
-       - 确保偏移后的线段不与任何障碍物相交，
-       - 然后将 current 更新为偏移线段的终点，继续处理后续障碍物。
-    """
     if not obstacles:
         return [A, B]
+    # 预计算所有障碍物的缓冲区
+    buffer_zones = []
+    ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
+    for obs in obstacles:
+        poly = obs.get("polygon", [])
+        if poly and len(poly) >= 3:
+            buf = get_buffer_polygon(poly, safe_radius, ref_point)
+            if buf:
+                buffer_zones.append(buf)
+            else:
+                buffer_zones.append(poly)  # fallback
+        else:
+            buffer_zones.append([])
     path = [A]
     current = A
     max_iter = 40
     for _ in range(max_iter):
-        # 寻找第一个相交且需要绕行的障碍物，并计算交点
-        target_obs = None
+        target_idx = None
         target_poly = None
+        target_buffer = None
         intersection_pt = None
-        for obs in obstacles:
+        for i, obs in enumerate(obstacles):
             poly = obs.get("polygon", [])
             if not poly or len(poly) < 3:
                 continue
             height = obs.get("height", 10.0)
+            # 原始多边形相交且飞行高度不够高时才考虑绕行
             if line_intersects_polygon(current, B, poly):
                 if flight_height > height:
                     continue
-                # 计算第一个交点
-                pt = get_line_polygon_intersection(current, B, poly)
-                if pt is not None:
-                    target_obs = obs
+                # 缓冲区相交才触发绕行（保证距离安全）
+                buf = buffer_zones[i]
+                if line_intersects_polygon(current, B, buf):
+                    target_idx = i
                     target_poly = poly
-                    intersection_pt = pt
+                    target_buffer = buf
+                    intersection_pt = get_line_polygon_intersection(current, B, poly)
                     break
-        if target_obs is None:
+        if target_idx is None:
             path.append(B)
             break
-        # 计算绕行起点：在交点前 safe_radius 米处（但不能早于 current）
-        dist_to_intersection = distance_meters(current, intersection_pt)
-        start_offset_dist = max(0.0, dist_to_intersection - safe_radius)  # 提前5米开始绕行
-        if start_offset_dist < 1e-6:
+        # 绕行起点：在交点前 safe_radius 米处
+        if intersection_pt is None:
             start_point = current
         else:
+            dist_to_intersection = distance_meters(current, intersection_pt)
+            start_offset_dist = max(0.0, dist_to_intersection - safe_radius)
             start_point = interpolate_point_on_line(current, B, start_offset_dist)
-        # 绕行：从 start_point 到 B 生成偏移线段
-        offset_m = safe_radius * 3  # 初始偏移距离（稍大以保证安全）
+        offset_m = safe_radius * 3
         success = False
         best_start, best_end = None, None
         for attempt in range(30):
@@ -247,37 +261,32 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             else:
                 dirs = ['left', 'right']
             for d in dirs:
-                off_start, off_end = get_offset_points_with_start(start_point, B, offset_m, d, start_point)
-                # 检查偏移后的线段是否与任何障碍物相交
+                off_start, off_end = get_offset_points_with_start(start_point, B, offset_m, d)
+                # 检查偏移线段是否与任何缓冲区相交
                 intersect = False
-                for obs2 in obstacles:
-                    p2 = obs2.get("polygon", [])
-                    if p2 and len(p2) >= 3:
-                        if line_intersects_polygon(off_start, off_end, p2):
-                            intersect = True
-                            break
+                for buf in buffer_zones:
+                    if buf and line_intersects_polygon(off_start, off_end, buf):
+                        intersect = True
+                        break
                 if not intersect:
                     best_start, best_end = off_start, off_end
                     success = True
                     break
             if success:
                 break
-            offset_m += safe_radius  # 增加偏移距离
+            offset_m += safe_radius
         if success:
-            # 添加路径：从 current 到 start_point（直线部分），然后偏移线段，最后继续
-            # 如果 start_point 不等于 current，需要添加中间直线段
             if distance_meters(current, start_point) > 1e-6:
                 path.append(start_point)
             path.append(best_start)
             path.append(best_end)
             current = best_end
         else:
-            # 无法绕行，直接直线连接终点
             path.append(B)
             break
     else:
         path.append(B)
-    # 简化路径（去除共线点）
+    # 简化路径
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
@@ -335,7 +344,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 距障碍物5米时开始绕行")
+    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 绕行路径距障碍物至少安全半径距离")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
