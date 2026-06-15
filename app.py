@@ -1,4 +1,4 @@
-# app.py 最终完整版（距离障碍物安全半径时开始绕行，且绕行路径保持安全距离）
+# app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -161,14 +161,12 @@ def get_offset_points_with_start(start_point, B, offset_meters, direction='left'
         return start_point, B
     ux = dx / length
     uy = dy / length
-    left_perp_x = -uy
-    left_perp_y = ux
-    if direction == 'left':
-        perp_x = left_perp_x
-        perp_y = left_perp_y
-    else:
-        perp_x = -left_perp_x
-        perp_y = -left_perp_y
+    # 垂直向量（基于行进方向的左手系）
+    perp_x = -uy
+    perp_y = ux
+    if direction == 'right':
+        perp_x = -perp_x
+        perp_y = -perp_y
     lat_rad = math.radians((start_point[1] + B[1]) / 2)
     meter_per_deg_lon = 111320 * math.cos(lat_rad)
     meter_per_deg_lat = 110540
@@ -198,68 +196,53 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         buffered_coords.append((lng, lat))
     return buffered_coords
 
-# ==================== 核心航线规划（严格距障碍物安全半径）====================
+# ==================== 核心航线规划（距离障碍物至少 safe_radius 米）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
-    # 预计算所有障碍物的缓冲区
-    buffer_zones = []
+    # 预计算障碍物缓冲区
     ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
+    buffer_zones = []
     for obs in obstacles:
         poly = obs.get("polygon", [])
         if poly and len(poly) >= 3:
             buf = get_buffer_polygon(poly, safe_radius, ref_point)
-            if buf:
-                buffer_zones.append(buf)
-            else:
-                buffer_zones.append(poly)
+            buffer_zones.append(buf if buf else poly)
         else:
             buffer_zones.append([])
     path = [A]
     current = A
-    max_iter = 40
+    max_iter = 50
     for _ in range(max_iter):
         target_idx = None
-        target_poly = None
         target_buffer = None
-        buffer_intersection_pt = None
+        intersection_pt = None
         for i, obs in enumerate(obstacles):
             poly = obs.get("polygon", [])
             if not poly or len(poly) < 3:
                 continue
             height = obs.get("height", 10.0)
-            # 原始多边形相交且飞行高度不足才考虑绕行
-            if line_intersects_polygon(current, B, poly):
-                if flight_height > height:
-                    continue
-                # 使用缓冲区判断是否进入安全距离
-                buf = buffer_zones[i]
-                if line_intersects_polygon(current, B, buf):
-                    target_idx = i
-                    target_poly = poly
-                    target_buffer = buf
-                    # 计算当前线段与缓冲区的第一个交点（即距离障碍物正好 safe_radius 的位置）
-                    buffer_intersection_pt = get_line_polygon_intersection(current, B, buf)
-                    break
+            # 飞行高度不够且原始多边形相交则触发绕行
+            if flight_height <= height and line_intersects_polygon(current, B, poly):
+                target_idx = i
+                target_buffer = buffer_zones[i]
+                intersection_pt = get_line_polygon_intersection(current, B, poly)
+                break
         if target_idx is None:
             path.append(B)
             break
-        # 绕行起点：缓冲区的交点（即距障碍物 safe_radius 的点）
-        if buffer_intersection_pt is None:
-            # 降级：使用原始多边形交点前 safe_radius 米
-            poly_intersection = get_line_polygon_intersection(current, B, target_poly)
-            if poly_intersection:
-                dist_to_poly = distance_meters(current, poly_intersection)
-                start_offset = max(0.0, dist_to_poly - safe_radius)
-                start_point = interpolate_point_on_line(current, B, start_offset)
-            else:
-                start_point = current
+        # 绕行起点：在交点前 safe_radius 米处
+        if intersection_pt is None:
+            start_point = current
         else:
-            start_point = buffer_intersection_pt
-        offset_m = safe_radius * 3
+            dist_to_intersection = distance_meters(current, intersection_pt)
+            start_offset = max(0.0, dist_to_intersection - safe_radius)
+            start_point = interpolate_point_on_line(current, B, start_offset)
+        # 尝试偏移
+        offset_m = safe_radius * 6
         success = False
         best_start, best_end = None, None
-        for attempt in range(30):
+        for attempt in range(40):
             if strategy == "向左绕行":
                 dirs = ['left']
             elif strategy == "向右绕行":
@@ -268,7 +251,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 dirs = ['left', 'right']
             for d in dirs:
                 off_start, off_end = get_offset_points_with_start(start_point, B, offset_m, d)
-                # 检查偏移线段是否与任何缓冲区相交
+                # 检查偏移后线段是否与任何缓冲区相交
                 intersect = False
                 for buf in buffer_zones:
                     if buf and line_intersects_polygon(off_start, off_end, buf):
@@ -282,8 +265,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 break
             offset_m += safe_radius
         if success:
-            # 添加从 current 到 start_point 的直线段（如果距离大于阈值）
-            if distance_meters(current, start_point) > 0.1:
+            if distance_meters(current, start_point) > 1e-6:
                 path.append(start_point)
             path.append(best_start)
             path.append(best_end)
@@ -291,8 +273,6 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         else:
             path.append(B)
             break
-    else:
-        path.append(B)
     # 简化路径
     simplified = [path[0]]
     for i in range(1, len(path)-1):
@@ -351,7 +331,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 距障碍物安全半径时开始绕行，绕行路径保持安全距离")
+    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 距障碍物5米开始绕行 | 向左/向右强制生效")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
