@@ -1,4 +1,4 @@
-# app.py 最终版（完整代码，包含障碍物缓冲区，保证绕行路径距障碍物至少 safe_radius 米）
+# app.py 最终完整版（距离障碍物安全半径时开始绕行，且绕行路径保持安全距离）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -198,7 +198,7 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         buffered_coords.append((lng, lat))
     return buffered_coords
 
-# ==================== 核心航线规划（距离障碍物至少 safe_radius 米）====================
+# ==================== 核心航线规划（严格距障碍物安全半径）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
@@ -212,7 +212,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             if buf:
                 buffer_zones.append(buf)
             else:
-                buffer_zones.append(poly)  # fallback
+                buffer_zones.append(poly)
         else:
             buffer_zones.append([])
     path = [A]
@@ -222,34 +222,40 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         target_idx = None
         target_poly = None
         target_buffer = None
-        intersection_pt = None
+        buffer_intersection_pt = None
         for i, obs in enumerate(obstacles):
             poly = obs.get("polygon", [])
             if not poly or len(poly) < 3:
                 continue
             height = obs.get("height", 10.0)
-            # 原始多边形相交且飞行高度不够高时才考虑绕行
+            # 原始多边形相交且飞行高度不足才考虑绕行
             if line_intersects_polygon(current, B, poly):
                 if flight_height > height:
                     continue
-                # 缓冲区相交才触发绕行（保证距离安全）
+                # 使用缓冲区判断是否进入安全距离
                 buf = buffer_zones[i]
                 if line_intersects_polygon(current, B, buf):
                     target_idx = i
                     target_poly = poly
                     target_buffer = buf
-                    intersection_pt = get_line_polygon_intersection(current, B, poly)
+                    # 计算当前线段与缓冲区的第一个交点（即距离障碍物正好 safe_radius 的位置）
+                    buffer_intersection_pt = get_line_polygon_intersection(current, B, buf)
                     break
         if target_idx is None:
             path.append(B)
             break
-        # 绕行起点：在交点前 safe_radius 米处
-        if intersection_pt is None:
-            start_point = current
+        # 绕行起点：缓冲区的交点（即距障碍物 safe_radius 的点）
+        if buffer_intersection_pt is None:
+            # 降级：使用原始多边形交点前 safe_radius 米
+            poly_intersection = get_line_polygon_intersection(current, B, target_poly)
+            if poly_intersection:
+                dist_to_poly = distance_meters(current, poly_intersection)
+                start_offset = max(0.0, dist_to_poly - safe_radius)
+                start_point = interpolate_point_on_line(current, B, start_offset)
+            else:
+                start_point = current
         else:
-            dist_to_intersection = distance_meters(current, intersection_pt)
-            start_offset_dist = max(0.0, dist_to_intersection - safe_radius)
-            start_point = interpolate_point_on_line(current, B, start_offset_dist)
+            start_point = buffer_intersection_pt
         offset_m = safe_radius * 3
         success = False
         best_start, best_end = None, None
@@ -276,7 +282,8 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 break
             offset_m += safe_radius
         if success:
-            if distance_meters(current, start_point) > 1e-6:
+            # 添加从 current 到 start_point 的直线段（如果距离大于阈值）
+            if distance_meters(current, start_point) > 0.1:
                 path.append(start_point)
             path.append(best_start)
             path.append(best_end)
@@ -344,7 +351,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 绕行路径距障碍物至少安全半径距离")
+    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 距障碍物安全半径时开始绕行，绕行路径保持安全距离")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
