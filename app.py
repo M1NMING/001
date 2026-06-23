@@ -1,4 +1,4 @@
-# app.py - 最终稳定版（地图永不空白）
+# app.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -161,6 +161,7 @@ def get_offset_points_with_start(start_point, B, offset_meters, direction='left'
         return start_point, B
     ux = dx / length
     uy = dy / length
+    # 垂直向量（基于行进方向的左手系）
     perp_x = -uy
     perp_y = ux
     if direction == 'right':
@@ -195,10 +196,11 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         buffered_coords.append((lng, lat))
     return buffered_coords
 
-# ==================== 核心航线规划 ====================
+# ==================== 核心航线规划（距离障碍物至少 safe_radius 米）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
+    # 预计算障碍物缓冲区
     ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
     buffer_zones = []
     for obs in obstacles:
@@ -213,25 +215,30 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
     max_iter = 50
     for _ in range(max_iter):
         target_idx = None
+        target_buffer = None
         intersection_pt = None
         for i, obs in enumerate(obstacles):
             poly = obs.get("polygon", [])
             if not poly or len(poly) < 3:
                 continue
             height = obs.get("height", 10.0)
+            # 飞行高度不够且原始多边形相交则触发绕行
             if flight_height <= height and line_intersects_polygon(current, B, poly):
                 target_idx = i
+                target_buffer = buffer_zones[i]
                 intersection_pt = get_line_polygon_intersection(current, B, poly)
                 break
         if target_idx is None:
             path.append(B)
             break
+        # 绕行起点：在交点前 safe_radius 米处
         if intersection_pt is None:
             start_point = current
         else:
             dist_to_intersection = distance_meters(current, intersection_pt)
             start_offset = max(0.0, dist_to_intersection - safe_radius)
             start_point = interpolate_point_on_line(current, B, start_offset)
+        # 尝试偏移
         offset_m = safe_radius * 6
         success = False
         best_start, best_end = None, None
@@ -244,6 +251,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 dirs = ['left', 'right']
             for d in dirs:
                 off_start, off_end = get_offset_points_with_start(start_point, B, offset_m, d)
+                # 检查偏移后线段是否与任何缓冲区相交
                 intersect = False
                 for buf in buffer_zones:
                     if buf and line_intersects_polygon(off_start, off_end, buf):
@@ -265,6 +273,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         else:
             path.append(B)
             break
+    # 简化路径
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
@@ -275,17 +284,15 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
     simplified.append(path[-1])
     return simplified
 
-# ==================== 创建地图（使用最稳定的 CartoDB Voyager 底图）====================
+# ==================== 创建地图（Esri 卫星图）====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
-    # 使用 CartoDB Voyager 底图，稳定且无需 API Key
     m = folium.Map(
         location=[center_lat, center_lng],
         zoom_start=15,
         control_scale=True,
-        tiles='https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Tiles &copy; Esri'
     )
-    # 添加障碍物
     for obs in obstacles:
         coords = obs.get("polygon", [])
         if coords and len(coords) >= 3:
@@ -297,24 +304,14 @@ def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, saf
                 fillOpacity=0.3,
                 popup=f'障碍物高度: {height} m'
             ).add_to(m)
-    # 起点终点
     folium.Marker(A_wgs, popup="起点 A", icon=folium.Icon(color='green', icon='play', prefix='fa')).add_to(m)
     folium.Marker(B_wgs, popup="终点 B", icon=folium.Icon(color='red', icon='flag-checkered', prefix='fa')).add_to(m)
-    # 航线
     if flight_path and len(flight_path) > 1:
         path_latlng = [(lat, lng) for lng, lat in flight_path]
         folium.PolyLine(path_latlng, color='cyan', weight=4, opacity=0.8, tooltip='规划航线').add_to(m)
-    # 绘制控件（只保留最基本功能，避免兼容性问题）
     draw = plugins.Draw(
-        draw_options={
-            'polygon': True,
-            'polyline': False,
-            'rectangle': False,
-            'circle': False,
-            'marker': False,
-            'circlemarker': False
-        }
-        # 移除 edit_options，防止某些版本报错
+        draw_options={'polygon': True, 'polyline': False, 'rectangle': False, 'circle': False, 'marker': False},
+        edit_options={'edit': True, 'remove': True}
     )
     draw.add_to(m)
     return m
@@ -334,7 +331,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 地图底图: CartoDB Voyager (稳定) | 距障碍物5米开始绕行")
+    st.sidebar.info("🗺️ 卫星图源: Esri World Imagery | 距障碍物5米开始绕行 | 向左/向右强制生效")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
@@ -449,7 +446,7 @@ def main():
             st.caption(f"当前障碍物数量: {len(st.session_state.obstacles)}")
         
         with left_col:
-            st.markdown("### 🗺️ 地图 (可绘制多边形圈选障碍物)")
+            st.markdown("### 🗺️ 卫星实况地图 (可绘制多边形圈选障碍物)")
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
             center_lat = (A_wgs_lat + B_wgs_lat) / 2
@@ -459,11 +456,9 @@ def main():
             B_point = (B_wgs_lng, B_wgs_lat)
             path = compute_avoidance_path(A_point, B_point, st.session_state.obstacles, st.session_state.flight_height, st.session_state.safe_radius, st.session_state.bypass_strategy)
             
-            # 创建地图并显示
             folium_map = create_map(center_lat, center_lng, st.session_state.obstacles, (A_wgs_lat, A_wgs_lng), (B_wgs_lat, B_wgs_lng), path, st.session_state.safe_radius)
-            output = st_folium(folium_map, width=800, height=600, key="unique_map_key")
+            output = st_folium(folium_map, width=800, height=600, key="satellite_map")
             
-            # 处理新绘制的多边形
             if output and output.get("last_active_drawing"):
                 drawing = output["last_active_drawing"]
                 if drawing and drawing.get("geometry") and drawing["geometry"]["type"] == "Polygon":
