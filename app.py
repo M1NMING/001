@@ -1,4 +1,4 @@
-# app.py - 基于缓冲区边界绕行版
+# app.py - 修正左右绕行方向
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -172,19 +172,16 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
     return buffered_coords
 
 def point_on_polygon_boundary(point, polygon_coords):
-    """将点投影到多边形边界上，返回边界上的最近点及其参数（长度）"""
     ring = LinearRing(polygon_coords)
     pt = Point(point[0], point[1])
     project_dist = ring.project(pt)
-    # 获取边界上的点
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划 ====================
+# ==================== 核心航线规划（修正左右方向）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
-    # 筛选活跃障碍物
     active_obstacles = []
     for obs in obstacles:
         poly = obs.get("polygon", [])
@@ -193,7 +190,6 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             active_obstacles.append(obs)
     if not active_obstacles:
         return [A, B]
-    # 预计算所有活跃障碍物的缓冲区
     ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
     buffer_zones = []
     for obs in active_obstacles:
@@ -220,7 +216,6 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         t_exit = max(t_values)
         if t_exit <= current_t:
             continue
-        # 绕行窗口：从入点前安全距离到出点后安全距离
         margin = safe_radius / dist_AB * 1.5
         t_start = max(current_t, t_enter - margin)
         t_end = min(1.0, t_exit + margin)
@@ -229,52 +224,31 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             t_end = min(1.0, t_exit + 0.03)
         P_start = interpolate_point_on_line(A, B, t_start)
         P_end = interpolate_point_on_line(A, B, t_end)
-        # 如果当前路径终点与P_start接近，则跳过
         if distance_meters(path[-1], P_start) > 0.1:
             path.append(P_start)
-        # 获取缓冲区边界
         buffer_poly = buffer_zones[idx]
         if not buffer_poly:
             path.append(P_end)
             current_t = t_end
             continue
-        # 将入点和出点投影到缓冲区边界上
         start_on_buf, start_dist = point_on_polygon_boundary(P_start, buffer_poly)
         end_on_buf, end_dist = point_on_polygon_boundary(P_end, buffer_poly)
-        # 缓冲区边界总长度
         ring = LinearRing(buffer_poly)
         total_len = ring.length
-        # 计算从start到end的两条路径距离（顺时针和逆时针）
+        # 计算顺时针和逆时针距离
         if end_dist >= start_dist:
             dist_cw = end_dist - start_dist
             dist_ccw = total_len - dist_cw
         else:
             dist_ccw = start_dist - end_dist
             dist_cw = total_len - dist_ccw
-        # 根据策略选择方向：左绕行 -> 逆时针（相当于沿边界左侧），右绕行 -> 顺时针（右侧）
-        # 但这里左右方向需要与真实地理方向匹配，简化：策略选择更短路径？
+        # 方向修正：向左绕行 -> 顺时针（障碍物在右侧），向右绕行 -> 逆时针（障碍物在左侧）
         if strategy == "向左绕行":
-            # 取逆时针路径（即从start沿边界正向走）
-            if dist_ccw < dist_cw or True:  # 我们可以根据策略决定
-                chosen_dist = dist_ccw if dist_ccw > 0 else total_len
-                use_cw = False
-            else:
-                chosen_dist = dist_cw
-                use_cw = True
+            use_cw = True
         elif strategy == "向右绕行":
-            if dist_cw < dist_ccw or True:
-                chosen_dist = dist_cw
-                use_cw = True
-            else:
-                chosen_dist = dist_ccw
-                use_cw = False
+            use_cw = False
         else:  # 最佳航线：选择较短的路径
-            if dist_cw <= dist_ccw:
-                chosen_dist = dist_cw
-                use_cw = True
-            else:
-                chosen_dist = dist_ccw
-                use_cw = False
+            use_cw = (dist_cw <= dist_ccw)
         # 生成沿缓冲区边界的点序列
         if use_cw:
             if end_dist >= start_dist:
@@ -286,28 +260,22 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                     segment = LineString(list(segment.coords) + list(seg2.coords))
         else:
             # 逆时针：从start向前走总长度 - chosen_dist
-            start_dist_ccw = start_dist
-            if start_dist_ccw - chosen_dist >= 0:
-                seg1 = substring(ring, start_dist_ccw - chosen_dist, start_dist_ccw)
+            if start_dist - dist_ccw >= 0:
+                seg1 = substring(ring, start_dist - dist_ccw, start_dist)
                 segment = seg1
             else:
-                seg1 = substring(ring, 0, start_dist_ccw)
-                remaining = chosen_dist - start_dist_ccw
+                seg1 = substring(ring, 0, start_dist)
+                remaining = dist_ccw - start_dist
                 seg2 = substring(ring, total_len - remaining, total_len)
                 segment = LineString(list(seg2.coords) + list(seg1.coords))
-        # 获取路径点
         boundary_points = list(segment.coords)
-        # 移除与起点终点重复的点
         if len(boundary_points) > 1:
-            # 确保从start到end顺序正确
-            # 检查第一个点是否接近start_on_buf，如果不是则反转
+            # 确保顺序从start到end
             if distance_meters(boundary_points[0], start_on_buf) > distance_meters(boundary_points[-1], start_on_buf):
                 boundary_points = boundary_points[::-1]
-            # 添加路径
             for pt in boundary_points:
                 if distance_meters(path[-1], pt) > 0.1:
                     path.append(pt)
-        # 添加终点P_end
         if distance_meters(path[-1], P_end) > 0.1:
             path.append(P_end)
         current_t = t_end
