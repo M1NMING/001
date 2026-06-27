@@ -1,4 +1,4 @@
-# app.py - 合并障碍物缓冲区整体绕行（健壮版）
+# app.py - 逐障碍物缓冲区绕行 + 强制回退
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -10,9 +10,8 @@ from datetime import datetime
 from streamlit_folium import st_folium
 import folium
 from folium import plugins
-from shapely.geometry import Polygon, Point, LineString, MultiPolygon, GeometryCollection
-from shapely.ops import unary_union, substring
-from shapely.affinity import translate
+from shapely.geometry import Polygon, Point, LineString
+from shapely.ops import unary_union
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机任务平台 | 智能航线规划", layout="wide")
@@ -167,12 +166,10 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
     buffered = local_poly.buffer(safe_radius, resolution=8)
     if buffered.is_empty:
         return None
-    # 提取外环坐标并确保首尾闭合
     exterior = buffered.exterior
     coords = list(exterior.coords)
     if len(coords) < 4:
         return None
-    # 确保首尾相同
     if coords[0] != coords[-1]:
         coords.append(coords[0])
     buffered_coords = []
@@ -182,14 +179,7 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         buffered_coords.append((lng, lat))
     return buffered_coords
 
-def point_on_polygon_boundary(point, polygon_coords):
-    ring = LinearRing(polygon_coords)
-    pt = Point(point[0], point[1])
-    project_dist = ring.project(pt)
-    boundary_point = ring.interpolate(project_dist)
-    return (boundary_point.x, boundary_point.y), project_dist
-
-# ==================== 核心航线规划（合并障碍物整体绕行，健壮版）====================
+# ==================== 核心航线规划（逐障碍物缓冲区绕行，强制回退）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
@@ -203,107 +193,176 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 active_obstacles.append(poly)
         if not active_obstacles:
             return [A, B]
-        # 生成每个障碍物的缓冲区多边形
+        # 为每个障碍物生成缓冲区坐标
         ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
-        buffer_polys = []
+        buffer_coords_list = []
         for poly in active_obstacles:
-            buf_coords = get_buffer_polygon(poly, safe_radius, ref_point)
-            if buf_coords and len(buf_coords) >= 4:
-                try:
-                    buffer_polys.append(Polygon(buf_coords))
-                except:
-                    pass
-        if not buffer_polys:
-            return [A, B]
-        # 合并所有缓冲区
-        merged = unary_union(buffer_polys)
-        if merged.is_empty:
-            return [A, B]
-        # 确保合并后是有效的多边形
-        if merged.geom_type == 'MultiPolygon':
-            # 取面积最大的多边形
-            largest = max(merged.geoms, key=lambda p: p.area)
-            merged = largest
-        elif merged.geom_type == 'GeometryCollection':
-            # 从中提取多边形
-            polygons = [g for g in merged.geoms if g.geom_type == 'Polygon']
-            if not polygons:
+            buf = get_buffer_polygon(poly, safe_radius, ref_point)
+            if buf and len(buf) >= 4:
+                buffer_coords_list.append(buf)
+        if not buffer_coords_list:
+            # 缓冲区生成失败，尝试简单偏移绕行
+            return simple_offset_avoidance(A, B, active_obstacles, safe_radius, strategy)
+        # 合并所有缓冲区多边形
+        try:
+            buffer_polys = [Polygon(buf) for buf in buffer_coords_list if len(buf) >= 4]
+            merged = unary_union(buffer_polys)
+            if merged.is_empty:
+                return simple_offset_avoidance(A, B, active_obstacles, safe_radius, strategy)
+            if merged.geom_type == 'MultiPolygon':
+                # 取最大多边形
+                largest = max(merged.geoms, key=lambda p: p.area)
+                merged = largest
+            elif merged.geom_type != 'Polygon':
+                return simple_offset_avoidance(A, B, active_obstacles, safe_radius, strategy)
+            exterior_coords = list(merged.exterior.coords)
+            if len(exterior_coords) < 4:
+                return simple_offset_avoidance(A, B, active_obstacles, safe_radius, strategy)
+            # 检查直线是否相交
+            if not line_intersects_polygon(A, B, exterior_coords):
                 return [A, B]
-            merged = max(polygons, key=lambda p: p.area)
-        elif merged.geom_type != 'Polygon':
+            intersections = get_line_polygon_intersection_points(A, B, exterior_coords)
+            if not intersections:
+                return simple_offset_avoidance(A, B, active_obstacles, safe_radius, strategy)
+            dist_AB = distance_meters(A, B)
+            if dist_AB < 1e-8:
+                return [A, B]
+            t_values = [distance_meters(A, pt) / dist_AB for pt in intersections]
+            t_enter = min(t_values)
+            t_exit = max(t_values)
+            margin = safe_radius / dist_AB * 1.5
+            t_start = max(0.0, t_enter - margin)
+            t_end = min(1.0, t_exit + margin)
+            if t_end - t_start < 0.01:
+                t_start = max(0.0, t_enter - 0.03)
+                t_end = min(1.0, t_exit + 0.03)
+            P_start = interpolate_point_on_line(A, B, t_start)
+            P_end = interpolate_point_on_line(A, B, t_end)
+            # 投影到边界
+            ring = LinearRing(exterior_coords)
+            start_dist = ring.project(Point(P_start))
+            end_dist = ring.project(Point(P_end))
+            total_len = ring.length
+            if end_dist >= start_dist:
+                dist_cw = end_dist - start_dist
+                dist_ccw = total_len - dist_cw
+            else:
+                dist_ccw = start_dist - end_dist
+                dist_cw = total_len - dist_ccw
+            if strategy == "向左绕行":
+                use_cw = True
+            elif strategy == "向右绕行":
+                use_cw = False
+            else:
+                use_cw = (dist_cw <= dist_ccw)
+            # 生成边界点
+            step_meters = 2.0
+            chosen_dist = dist_cw if use_cw else dist_ccw
+            num_steps = max(2, int(chosen_dist / step_meters))
+            boundary_points = []
+            if use_cw:
+                for i in range(num_steps + 1):
+                    frac = i / num_steps
+                    dist = start_dist + frac * dist_cw
+                    if dist > total_len:
+                        dist -= total_len
+                    pt = ring.interpolate(dist)
+                    boundary_points.append((pt.x, pt.y))
+            else:
+                for i in range(num_steps + 1):
+                    frac = i / num_steps
+                    dist = start_dist - frac * dist_ccw
+                    if dist < 0:
+                        dist += total_len
+                    pt = ring.interpolate(dist)
+                    boundary_points.append((pt.x, pt.y))
+            # 构建路径
+            path = [A]
+            if distance_meters(path[-1], P_start) > 0.1:
+                path.append(P_start)
+            for pt in boundary_points:
+                if distance_meters(path[-1], pt) > 0.1:
+                    path.append(pt)
+            if distance_meters(path[-1], P_end) > 0.1:
+                path.append(P_end)
+            if distance_meters(path[-1], B) > 0.1:
+                path.append(B)
+            # 简化
+            simplified = [path[0]]
+            for i in range(1, len(path)-1):
+                p1 = simplified[-1]
+                p2 = path[i]
+                p3 = path[i+1]
+                if abs((p2[0]-p1[0])*(p3[1]-p2[1]) - (p2[1]-p1[1])*(p3[0]-p2[0])) > 1e-8:
+                    simplified.append(p2)
+            simplified.append(path[-1])
+            return simplified
+        except:
+            return simple_offset_avoidance(A, B, active_obstacles, safe_radius, strategy)
+    except:
+        return [A, B]
+
+def simple_offset_avoidance(A, B, obstacles, safe_radius, strategy):
+    """简单偏移绕行（回退方案）"""
+    try:
+        if not obstacles:
             return [A, B]
-        # 获取外环坐标
-        exterior_coords = list(merged.exterior.coords)
-        if len(exterior_coords) < 4:
-            return [A, B]
-        # 检查直线是否与合并区域相交
-        if not line_intersects_polygon(A, B, exterior_coords):
-            return [A, B]
-        # 获取交点
-        intersections = get_line_polygon_intersection_points(A, B, exterior_coords)
-        if not intersections:
-            return [A, B]
-        dist_AB = distance_meters(A, B)
-        if dist_AB < 1e-8:
-            return [A, B]
-        t_values = [distance_meters(A, pt) / dist_AB for pt in intersections]
-        t_enter = min(t_values)
-        t_exit = max(t_values)
-        margin = safe_radius / dist_AB * 1.5
-        t_start = max(0.0, t_enter - margin)
-        t_end = min(1.0, t_exit + margin)
-        if t_end - t_start < 0.01:
-            t_start = max(0.0, t_enter - 0.03)
-            t_end = min(1.0, t_exit + 0.03)
-        P_start = interpolate_point_on_line(A, B, t_start)
-        P_end = interpolate_point_on_line(A, B, t_end)
-        # 投影到边界
-        start_on_buf, start_dist = point_on_polygon_boundary(P_start, exterior_coords)
-        end_on_buf, end_dist = point_on_polygon_boundary(P_end, exterior_coords)
-        ring = LinearRing(exterior_coords)
-        total_len = ring.length
-        if end_dist >= start_dist:
-            dist_cw = end_dist - start_dist
-            dist_ccw = total_len - dist_cw
-        else:
-            dist_ccw = start_dist - end_dist
-            dist_cw = total_len - dist_ccw
-        if strategy == "向左绕行":
-            use_cw = True
-        elif strategy == "向右绕行":
-            use_cw = False
-        else:
-            use_cw = (dist_cw <= dist_ccw)
-        # 生成边界点
-        step_meters = 2.0
-        chosen_dist = dist_cw if use_cw else dist_ccw
-        num_steps = max(2, int(chosen_dist / step_meters))
-        boundary_points = []
-        if use_cw:
-            for i in range(num_steps + 1):
-                frac = i / num_steps
-                dist = start_dist + frac * dist_cw
-                if dist > total_len:
-                    dist -= total_len
-                pt = ring.interpolate(dist)
-                boundary_points.append((pt.x, pt.y))
-        else:
-            for i in range(num_steps + 1):
-                frac = i / num_steps
-                dist = start_dist - frac * dist_ccw
-                if dist < 0:
-                    dist += total_len
-                pt = ring.interpolate(dist)
-                boundary_points.append((pt.x, pt.y))
-        # 构建路径
         path = [A]
-        if distance_meters(path[-1], P_start) > 0.1:
-            path.append(P_start)
-        for pt in boundary_points:
-            if distance_meters(path[-1], pt) > 0.1:
-                path.append(pt)
-        if distance_meters(path[-1], P_end) > 0.1:
-            path.append(P_end)
+        current = A
+        for poly in obstacles:
+            if not line_intersects_polygon(current, B, poly):
+                continue
+            # 计算偏移方向
+            dx = B[0] - current[0]
+            dy = B[1] - current[1]
+            length = math.hypot(dx, dy)
+            if length < 1e-8:
+                continue
+            ux = dx / length
+            uy = dy / length
+            perp_x = -uy
+            perp_y = ux
+            if strategy == "向左绕行":
+                p_x, p_y = -perp_x, -perp_y
+            elif strategy == "向右绕行":
+                p_x, p_y = perp_x, perp_y
+            else:
+                # 最佳：尝试左右，选偏移后不与任何障碍物相交的方向
+                left_ok = True
+                right_ok = True
+                for p in obstacles:
+                    if line_intersects_polygon((current[0]-perp_x*safe_radius*6, current[1]-perp_y*safe_radius*6),
+                                                (B[0]-perp_x*safe_radius*6, B[1]-perp_y*safe_radius*6), p):
+                        left_ok = False
+                    if line_intersects_polygon((current[0]+perp_x*safe_radius*6, current[1]+perp_y*safe_radius*6),
+                                                (B[0]+perp_x*safe_radius*6, B[1]+perp_y*safe_radius*6), p):
+                        right_ok = False
+                if left_ok and not right_ok:
+                    p_x, p_y = -perp_x, -perp_y
+                elif right_ok and not left_ok:
+                    p_x, p_y = perp_x, perp_y
+                else:
+                    p_x, p_y = -perp_x, -perp_y
+            offset_m = safe_radius * 6
+            for attempt in range(30):
+                lat_rad = math.radians((current[1] + B[1]) / 2)
+                meter_per_deg_lon = 111320 * math.cos(lat_rad)
+                meter_per_deg_lat = 110540
+                off_lon = offset_m / meter_per_deg_lon * p_x
+                off_lat = offset_m / meter_per_deg_lat * p_y
+                off_start = (current[0] + off_lon, current[1] + off_lat)
+                off_end = (B[0] + off_lon, B[1] + off_lat)
+                intersect = False
+                for p in obstacles:
+                    if line_intersects_polygon(off_start, off_end, p):
+                        intersect = True
+                        break
+                if not intersect:
+                    path.append(off_start)
+                    path.append(off_end)
+                    current = off_end
+                    break
+                offset_m += safe_radius
         if distance_meters(path[-1], B) > 0.1:
             path.append(B)
         # 简化
@@ -316,8 +375,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 simplified.append(p2)
         simplified.append(path[-1])
         return simplified
-    except Exception as e:
-        # 任何错误都返回直线路径
+    except:
         return [A, B]
 
 # ==================== 创建地图 ====================
@@ -383,7 +441,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 合并障碍物整体绕行，保持5米安全距离")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 逐障碍物缓冲区绕行，回退机制保障")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
