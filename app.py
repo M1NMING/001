@@ -1,4 +1,4 @@
-# app.py - 最终版（卫星图 + 沿边界绕行）
+# app.py - 最终稳定版（卫星/街道双图层 + 沿障碍物边界5米绕行）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -198,7 +198,7 @@ def point_on_polygon_boundary(point, polygon_coords):
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（沿缓冲区边界绕行）====================
+# ==================== 核心航线规划（沿缓冲区边界绕行，保持5米）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
@@ -302,20 +302,17 @@ def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, saf
         location=[center_lat, center_lng],
         zoom_start=15,
         control_scale=True,
-        tiles=None  # 不设默认，手动添加
+        tiles=None
     )
-    # 添加 Esri 卫星图（首选）
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Tiles &copy; Esri',
         name='卫星影像'
     ).add_to(m)
-    # 添加 OpenStreetMap 街道图（备选）
     folium.TileLayer(
         tiles='OpenStreetMap',
         name='街道图'
     ).add_to(m)
-    # 添加图层切换控件
     folium.LayerControl().add_to(m)
     
     for obs in obstacles:
@@ -362,7 +359,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 可点击右上角切换至街道图 | 沿障碍物边缘平行飞行")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 可切换至街道图 | 航线距障碍物边缘5米")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
