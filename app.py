@@ -1,4 +1,4 @@
-# app.py - 稳健版（OSM底图 + 强化异常处理）
+# app.py - 最终版（卫星图 + 沿边界绕行）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -296,14 +296,28 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
     except Exception as e:
         return [A, B]
 
-# ==================== 创建地图 ====================
+# ==================== 创建地图（卫星图 + 街道图双图层）====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
     m = folium.Map(
         location=[center_lat, center_lng],
         zoom_start=15,
         control_scale=True,
-        tiles='OpenStreetMap'  # 稳定底图
+        tiles=None  # 不设默认，手动添加
     )
+    # 添加 Esri 卫星图（首选）
+    folium.TileLayer(
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Tiles &copy; Esri',
+        name='卫星影像'
+    ).add_to(m)
+    # 添加 OpenStreetMap 街道图（备选）
+    folium.TileLayer(
+        tiles='OpenStreetMap',
+        name='街道图'
+    ).add_to(m)
+    # 添加图层切换控件
+    folium.LayerControl().add_to(m)
+    
     for obs in obstacles:
         coords = obs.get("polygon", [])
         if coords and len(coords) >= 3:
@@ -348,7 +362,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 地图: OpenStreetMap | 沿障碍物边缘平行绕行，安全距离5米")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 可点击右上角切换至街道图 | 沿障碍物边缘平行飞行")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
@@ -463,8 +477,8 @@ def main():
             st.caption(f"当前障碍物数量: {len(st.session_state.obstacles)}")
         
         with left_col:
-            st.markdown("### 🗺️ 地图 (可绘制多边形圈选障碍物)")
-            st.caption("绘制多边形后自动保存，绕行航线沿障碍物边缘平行飞行")
+            st.markdown("### 🗺️ 卫星地图 (可绘制多边形圈选障碍物)")
+            st.caption("💡 如卫星图未显示，请点击地图右上角图层按钮切换至\"街道图\"")
             A_wgs_lng, A_wgs_lat = gcj02_to_wgs84(st.session_state.A_lng_gcj, st.session_state.A_lat_gcj)
             B_wgs_lng, B_wgs_lat = gcj02_to_wgs84(st.session_state.B_lng_gcj, st.session_state.B_lat_gcj)
             center_lat = (A_wgs_lat + B_wgs_lat) / 2
