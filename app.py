@@ -1,4 +1,4 @@
-# app.py - 沿障碍物边缘平行绕行（安全距离5米，方向修正）
+# app.py - 沿障碍物边缘平行绕行（安全距离5米）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -12,7 +12,6 @@ import folium
 from folium import plugins
 from shapely.geometry import Polygon, Point, LineString, LinearRing
 from shapely.ops import substring
-from shapely.validation import make_valid
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机任务平台 | 智能航线规划", layout="wide")
@@ -153,49 +152,33 @@ def get_line_polygon_intersection_points(A, B, polygon):
     return points
 
 def get_buffer_polygon(polygon, safe_radius, ref_point):
-    """生成障碍物的安全缓冲区（向外扩展 safe_radius 米），返回外环坐标列表"""
+    """生成障碍物的安全缓冲区（向外扩展 safe_radius 米）"""
     if not polygon or len(polygon) < 3:
         return None
-    # 先清理多边形（处理自交等）
-    try:
-        poly = Polygon(polygon)
-        if not poly.is_valid:
-            poly = make_valid(poly)
-        if poly.geom_type != 'Polygon':
-            # 如果变成MultiPolygon，取面积最大的
-            if poly.geom_type == 'MultiPolygon':
-                poly = max(poly.geoms, key=lambda p: p.area)
-            else:
-                return None
-        # 转换到局部平面坐标
-        center_lng, center_lat = ref_point
-        meter_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
-        meter_per_deg_lat = 110540
-        local_points = []
-        for p in poly.exterior.coords:
-            dx = (p[0] - center_lng) * meter_per_deg_lon
-            dy = (p[1] - center_lat) * meter_per_deg_lat
-            local_points.append((dx, dy))
-        local_poly = Polygon(local_points)
-        buffered = local_poly.buffer(safe_radius, resolution=12)
-        if buffered.is_empty:
-            return None
-        exterior = buffered.exterior
-        coords = list(exterior.coords)
-        if len(coords) < 4:
-            return None
-        # 转换回经纬度
-        buffered_coords = []
-        for pt in coords:
-            lng = center_lng + pt[0] / meter_per_deg_lon
-            lat = center_lat + pt[1] / meter_per_deg_lat
-            buffered_coords.append((lng, lat))
-        # 确保首尾闭合
-        if buffered_coords[0] != buffered_coords[-1]:
-            buffered_coords.append(buffered_coords[0])
-        return buffered_coords
-    except:
+    center_lng, center_lat = ref_point
+    meter_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
+    meter_per_deg_lat = 110540
+    local_points = []
+    for p in polygon:
+        dx = (p[0] - center_lng) * meter_per_deg_lon
+        dy = (p[1] - center_lat) * meter_per_deg_lat
+        local_points.append((dx, dy))
+    local_poly = Polygon(local_points)
+    buffered = local_poly.buffer(safe_radius, resolution=12)  # 提高分辨率使边界更平滑
+    if buffered.is_empty:
         return None
+    exterior = buffered.exterior
+    coords = list(exterior.coords)
+    if len(coords) < 4:
+        return None
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+    buffered_coords = []
+    for pt in coords:
+        lng = center_lng + pt[0] / meter_per_deg_lon
+        lat = center_lat + pt[1] / meter_per_deg_lat
+        buffered_coords.append((lng, lat))
+    return buffered_coords
 
 def point_on_polygon_boundary(point, polygon_coords):
     """将点投影到多边形边界上，返回边界上的点及其弧长参数"""
@@ -205,12 +188,12 @@ def point_on_polygon_boundary(point, polygon_coords):
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（沿障碍物边缘平行绕行，安全距离5米）====================
+# ==================== 核心航线规划（沿障碍物边缘平行绕行）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
             return [A, B]
-        # 筛选需绕行的障碍物（飞行高度不足）
+        # 筛选飞行高度不足的障碍物（需绕行）
         active_obstacles = []
         for obs in obstacles:
             poly = obs.get("polygon", [])
@@ -222,24 +205,27 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
         path = [A]
         current = A
+        # 依次处理每个活跃障碍物
         for poly in active_obstacles:
-            # 生成缓冲区
+            # 生成缓冲区（即安全距离轮廓）
             buf_coords = get_buffer_polygon(poly, safe_radius, ref_point)
             if not buf_coords or len(buf_coords) < 4:
-                continue
+                continue  # 无法生成缓冲区则跳过
             # 检查当前点到终点的直线是否与缓冲区相交
             if not line_intersects_polygon(current, B, buf_coords):
-                continue
+                continue  # 不影响，继续直线
+            # 获取交点（入点和出点）
             pts = get_line_polygon_intersection_points(current, B, buf_coords)
             if not pts:
                 continue
             dist_AB = distance_meters(current, B)
             if dist_AB < 1e-8:
                 continue
+            # 按距current的距离排序t值
             t_vals = [distance_meters(current, pt) / dist_AB for pt in pts]
             t_enter = min(t_vals)
             t_exit = max(t_vals)
-            # 扩展绕行窗口（提前入、延后出）
+            # 扩展绕行窗口（提前入、延后出，使航线更平滑）
             margin = safe_radius / dist_AB * 1.5
             t_start = max(0.0, t_enter - margin)
             t_end = min(1.0, t_exit + margin)
@@ -248,25 +234,26 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 t_end = min(1.0, t_exit + 0.03)
             P_start = interpolate_point_on_line(current, B, t_start)
             P_end = interpolate_point_on_line(current, B, t_end)
-            # 投影到缓冲区边界
+            # 将入点和出点投影到缓冲区边界
             start_on_buf, start_dist = point_on_polygon_boundary(P_start, buf_coords)
             end_on_buf, end_dist = point_on_polygon_boundary(P_end, buf_coords)
             ring = LinearRing(buf_coords)
             total_len = ring.length
+            # 计算顺时针和逆时针沿边界的距离
             if end_dist >= start_dist:
                 dist_cw = end_dist - start_dist
                 dist_ccw = total_len - dist_cw
             else:
                 dist_ccw = start_dist - end_dist
                 dist_cw = total_len - dist_ccw
-            # 绕行方向：向左绕行 -> 顺时针（沿边界正向），向右绕行 -> 逆时针
+            # 绕行方向选择
             if strategy == "向左绕行":
-                use_cw = True
+                use_cw = True  # 顺时针
             elif strategy == "向右绕行":
-                use_cw = False
-            else:
+                use_cw = False  # 逆时针
+            else:  # 最佳航线
                 use_cw = (dist_cw <= dist_ccw)
-            # 采样边界点
+            # 沿边界采样（步长2米）
             step_meters = 2.0
             chosen_dist = dist_cw if use_cw else dist_ccw
             num_steps = max(2, int(chosen_dist / step_meters))
@@ -296,10 +283,11 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                     path.append(pt)
             if distance_meters(path[-1], P_end) > 0.1:
                 path.append(P_end)
-            current = P_end
+            current = P_end  # 更新当前位置
+        # 最后连接到终点B
         if distance_meters(current, B) > 0.1:
             path.append(B)
-        # 简化路径
+        # 简化路径（去除共线点）
         simplified = [path[0]]
         for i in range(1, len(path)-1):
             p1 = simplified[-1]
@@ -310,7 +298,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         simplified.append(path[-1])
         return simplified
     except Exception as e:
-        # 错误降级为直线
+        # 任何错误降级为直线
         return [A, B]
 
 # ==================== 创建地图 ====================
