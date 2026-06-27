@@ -1,4 +1,4 @@
-# app.py - 修正左右绕行方向
+# app.py - 简化高效版（缓冲区偏移绕行，方向已修正）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -10,8 +10,7 @@ from datetime import datetime
 from streamlit_folium import st_folium
 import folium
 from folium import plugins
-from shapely.geometry import Polygon, Point, LineString, LinearRing
-from shapely.ops import nearest_points, substring
+from shapely.geometry import Polygon, Point, LineString
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机任务平台 | 智能航线规划", layout="wide")
@@ -163,7 +162,7 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         dy = (p[1] - center_lat) * meter_per_deg_lat
         local_points.append((dx, dy))
     local_poly = Polygon(local_points)
-    buffered = local_poly.buffer(safe_radius, resolution=16)
+    buffered = local_poly.buffer(safe_radius, resolution=12)  # 适当降低精度提升性能
     buffered_coords = []
     for pt in buffered.exterior.coords:
         lng = center_lng + pt[0] / meter_per_deg_lon
@@ -171,17 +170,11 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         buffered_coords.append((lng, lat))
     return buffered_coords
 
-def point_on_polygon_boundary(point, polygon_coords):
-    ring = LinearRing(polygon_coords)
-    pt = Point(point[0], point[1])
-    project_dist = ring.project(pt)
-    boundary_point = ring.interpolate(project_dist)
-    return (boundary_point.x, boundary_point.y), project_dist
-
-# ==================== 核心航线规划（修正左右方向）====================
+# ==================== 核心航线规划（简化偏移绕行）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
+    # 筛选活跃障碍物（飞行高度 <= 障碍物高度）
     active_obstacles = []
     for obs in obstacles:
         poly = obs.get("polygon", [])
@@ -190,98 +183,90 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             active_obstacles.append(obs)
     if not active_obstacles:
         return [A, B]
+    
     ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
+    # 预计算所有活跃障碍物的缓冲区
     buffer_zones = []
     for obs in active_obstacles:
         poly = obs.get("polygon", [])
         buf = get_buffer_polygon(poly, safe_radius, ref_point)
         buffer_zones.append(buf if buf else poly)
+    
     path = [A]
-    current_t = 0.0
-    for idx, obs in enumerate(active_obstacles):
-        poly = obs.get("polygon", [])
-        intersections = get_line_polygon_intersection_points(A, B, poly)
-        if not intersections:
-            continue
-        t_values = []
-        dist_AB = distance_meters(A, B)
-        if dist_AB < 1e-8:
-            continue
-        for pt in intersections:
-            t = distance_meters(A, pt) / dist_AB
-            t_values.append(t)
-        if not t_values:
-            continue
-        t_enter = min(t_values)
-        t_exit = max(t_values)
-        if t_exit <= current_t:
-            continue
-        margin = safe_radius / dist_AB * 1.5
-        t_start = max(current_t, t_enter - margin)
-        t_end = min(1.0, t_exit + margin)
-        if t_end - t_start < 0.01:
-            t_start = max(current_t, t_enter - 0.03)
-            t_end = min(1.0, t_exit + 0.03)
-        P_start = interpolate_point_on_line(A, B, t_start)
-        P_end = interpolate_point_on_line(A, B, t_end)
-        if distance_meters(path[-1], P_start) > 0.1:
-            path.append(P_start)
-        buffer_poly = buffer_zones[idx]
-        if not buffer_poly:
-            path.append(P_end)
-            current_t = t_end
-            continue
-        start_on_buf, start_dist = point_on_polygon_boundary(P_start, buffer_poly)
-        end_on_buf, end_dist = point_on_polygon_boundary(P_end, buffer_poly)
-        ring = LinearRing(buffer_poly)
-        total_len = ring.length
-        # 计算顺时针和逆时针距离
-        if end_dist >= start_dist:
-            dist_cw = end_dist - start_dist
-            dist_ccw = total_len - dist_cw
-        else:
-            dist_ccw = start_dist - end_dist
-            dist_cw = total_len - dist_ccw
-        # 方向修正：向左绕行 -> 顺时针（障碍物在右侧），向右绕行 -> 逆时针（障碍物在左侧）
+    current = A
+    max_iter = 30
+    for _ in range(max_iter):
+        # 寻找第一个与当前线段相交的障碍物
+        target_idx = None
+        for i, obs in enumerate(active_obstacles):
+            poly = obs.get("polygon", [])
+            if line_intersects_polygon(current, B, poly):
+                target_idx = i
+                break
+        if target_idx is None:
+            path.append(B)
+            break
+        # 对该障碍物进行绕行偏移（偏移方向：左绕行 -> 右偏移，右绕行 -> 左偏移）
+        # 策略决定偏移方向：向左绕行时，障碍物在右侧，所以航线向右偏移；向右绕行则向左偏移
         if strategy == "向左绕行":
-            use_cw = True
+            dirs = ['right']  # 修正：向左绕行实际是右偏移
         elif strategy == "向右绕行":
-            use_cw = False
-        else:  # 最佳航线：选择较短的路径
-            use_cw = (dist_cw <= dist_ccw)
-        # 生成沿缓冲区边界的点序列
-        if use_cw:
-            if end_dist >= start_dist:
-                segment = substring(ring, start_dist, end_dist)
-            else:
-                segment = substring(ring, start_dist, total_len)
-                if end_dist > 0:
-                    seg2 = substring(ring, 0, end_dist)
-                    segment = LineString(list(segment.coords) + list(seg2.coords))
+            dirs = ['left']   # 修正：向右绕行实际是左偏移
         else:
-            # 逆时针：从start向前走总长度 - chosen_dist
-            if start_dist - dist_ccw >= 0:
-                seg1 = substring(ring, start_dist - dist_ccw, start_dist)
-                segment = seg1
-            else:
-                seg1 = substring(ring, 0, start_dist)
-                remaining = dist_ccw - start_dist
-                seg2 = substring(ring, total_len - remaining, total_len)
-                segment = LineString(list(seg2.coords) + list(seg1.coords))
-        boundary_points = list(segment.coords)
-        if len(boundary_points) > 1:
-            # 确保顺序从start到end
-            if distance_meters(boundary_points[0], start_on_buf) > distance_meters(boundary_points[-1], start_on_buf):
-                boundary_points = boundary_points[::-1]
-            for pt in boundary_points:
-                if distance_meters(path[-1], pt) > 0.1:
-                    path.append(pt)
-        if distance_meters(path[-1], P_end) > 0.1:
-            path.append(P_end)
-        current_t = t_end
-    if distance_meters(path[-1], B) > 1e-6:
+            dirs = ['left', 'right']  # 最佳航线尝试两个方向
+        offset_m = safe_radius * 6
+        success = False
+        best_start, best_end = None, None
+        # 获取当前点到终点的方向
+        dx = B[0] - current[0]
+        dy = B[1] - current[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-8:
+            path.append(B)
+            break
+        ux = dx / length
+        uy = dy / length
+        # 计算垂直向量（左为负，右为正）
+        perp_x = -uy
+        perp_y = ux
+        for attempt in range(40):
+            for d in dirs:
+                # 根据方向设置偏移符号
+                if d == 'left':
+                    p_x, p_y = -perp_x, -perp_y
+                else:
+                    p_x, p_y = perp_x, perp_y
+                # 实际偏移量
+                lat_rad = math.radians((current[1] + B[1]) / 2)
+                meter_per_deg_lon = 111320 * math.cos(lat_rad)
+                meter_per_deg_lat = 110540
+                off_lon = offset_m / meter_per_deg_lon * p_x
+                off_lat = offset_m / meter_per_deg_lat * p_y
+                off_start = (current[0] + off_lon, current[1] + off_lat)
+                off_end = (B[0] + off_lon, B[1] + off_lat)
+                # 检查偏移线段是否与任何缓冲区相交
+                intersect = False
+                for buf in buffer_zones:
+                    if buf and line_intersects_polygon(off_start, off_end, buf):
+                        intersect = True
+                        break
+                if not intersect:
+                    best_start, best_end = off_start, off_end
+                    success = True
+                    break
+            if success:
+                break
+            offset_m += safe_radius
+        if success:
+            path.append(best_start)
+            path.append(best_end)
+            current = best_end
+        else:
+            path.append(B)
+            break
+    else:
         path.append(B)
-    # 简化路径
+    # 简化路径（去除共线点）
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
@@ -292,7 +277,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
     simplified.append(path[-1])
     return simplified
 
-# ==================== 创建地图 ====================
+# ==================== 创建地图（Esri卫星图 + OSM备选）====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
     m = folium.Map(
         location=[center_lat, center_lng],
@@ -355,7 +340,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 绕行路径沿障碍物边缘5米平行飞行")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 绕行方向已修正（左绕行=右偏移，右绕行=左偏移）")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
