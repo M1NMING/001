@@ -1,4 +1,4 @@
-# app.py
+# app.py - 修正版（缓冲区检测 + 增大偏移）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -126,7 +126,7 @@ def distance_meters(p1, p2):
 def interpolate_point_on_line(A, B, t):
     return (A[0] + t * (B[0] - A[0]), A[1] + t * (B[1] - A[1]))
 
-def get_offset_segment(A, B, offset_meters, direction='left'):
+def get_offset_points(A, B, offset_meters, direction='left'):
     dx = B[0] - A[0]
     dy = B[1] - A[1]
     length = math.hypot(dx, dy)
@@ -172,10 +172,31 @@ def get_line_polygon_intersection_points(A, B, polygon):
         points.extend(coords)
     return points
 
+def get_buffer_polygon(polygon, safe_radius, ref_point):
+    if not polygon or len(polygon) < 3:
+        return None
+    center_lng, center_lat = ref_point
+    meter_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
+    meter_per_deg_lat = 110540
+    local_points = []
+    for p in polygon:
+        dx = (p[0] - center_lng) * meter_per_deg_lon
+        dy = (p[1] - center_lat) * meter_per_deg_lat
+        local_points.append((dx, dy))
+    local_poly = Polygon(local_points)
+    buffered = local_poly.buffer(safe_radius)
+    buffered_coords = []
+    for pt in buffered.exterior.coords:
+        lng = center_lng + pt[0] / meter_per_deg_lon
+        lat = center_lat + pt[1] / meter_per_deg_lat
+        buffered_coords.append((lng, lat))
+    return buffered_coords
+
 # ==================== 核心航线规划 ====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     if not obstacles:
         return [A, B]
+    # 筛选活跃障碍物
     active_obstacles = []
     for obs in obstacles:
         poly = obs.get("polygon", [])
@@ -184,92 +205,83 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             active_obstacles.append(obs)
     if not active_obstacles:
         return [A, B]
-    
+    # 预计算所有活跃障碍物的缓冲区
+    ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
+    buffer_zones = []
+    for obs in active_obstacles:
+        poly = obs.get("polygon", [])
+        buf = get_buffer_polygon(poly, safe_radius, ref_point)
+        buffer_zones.append(buf if buf else poly)
     path = [A]
     current_t = 0.0
-    dist_AB = distance_meters(A, B)
-    if dist_AB < 1e-6:
-        return [A, B]
-    
-    # 处理每个障碍物，按在直线上出现的顺序排序
-    obstacle_intervals = []
     for idx, obs in enumerate(active_obstacles):
         poly = obs.get("polygon", [])
-        pts = get_line_polygon_intersection_points(A, B, poly)
-        if not pts:
+        # 获取原始多边形与直线的交点
+        intersections = get_line_polygon_intersection_points(A, B, poly)
+        if not intersections:
             continue
-        t_vals = []
-        for pt in pts:
-            t = distance_meters(A, pt) / dist_AB
-            t_vals.append(t)
-        if not t_vals:
+        t_values = []
+        dist_AB = distance_meters(A, B)
+        if dist_AB < 1e-8:
             continue
-        t_min = min(t_vals)
-        t_max = max(t_vals)
-        obstacle_intervals.append((t_min, t_max, idx, obs))
-    # 按 t_min 排序
-    obstacle_intervals.sort(key=lambda x: x[0])
-    
-    for t_min, t_max, idx, obs in obstacle_intervals:
-        if t_max <= current_t:
+        for pt in intersections:
+            dist_pt_A = distance_meters(A, pt)
+            t = dist_pt_A / dist_AB
+            t_values.append(t)
+        if not t_values:
             continue
-        # 绕行窗口从 t_start 到 t_end (加上安全距离)
-        margin = safe_radius / dist_AB
-        t_start = max(current_t, t_min - margin)
-        t_end = min(1.0, t_max + margin)
+        t_enter = min(t_values)
+        t_exit = max(t_values)
+        if t_exit <= current_t:
+            continue
+        # 绕行窗口：从入点前安全距离到出点后安全距离
+        margin = safe_radius / dist_AB * 1.5  # 稍微加大
+        t_start = max(current_t, t_enter - margin)
+        t_end = min(1.0, t_exit + margin)
         if t_end - t_start < 0.01:
-            t_start = max(current_t, t_min - 0.02)
-            t_end = min(1.0, t_max + 0.02)
+            t_start = max(current_t, t_enter - 0.03)
+            t_end = min(1.0, t_exit + 0.03)
         P_start = interpolate_point_on_line(A, B, t_start)
         P_end = interpolate_point_on_line(A, B, t_end)
-        
-        # 如果路径末尾不是 P_start，则添加 P_start
-        if len(path) > 0 and distance_meters(path[-1], P_start) > 1e-6:
+        # 如果已经接近当前路径终点，则跳过
+        if distance_meters(path[-1], P_start) > 0.1:
             path.append(P_start)
-        
-        # 生成偏移段
-        offset_m = safe_radius * 4
+        # 尝试偏移
+        offset_m = safe_radius * 8  # 起始偏移加大
         success = False
-        best_off_start, best_off_end = None, None
-        # 根据策略尝试左右方向
-        if strategy == "向左绕行":
-            dirs = ['left']
-        elif strategy == "向右绕行":
-            dirs = ['right']
-        else:
-            dirs = ['left', 'right']
-        for attempt in range(30):
+        best_offset_start, best_offset_end = None, None
+        for attempt in range(40):
+            if strategy == "向左绕行":
+                dirs = ['left']
+            elif strategy == "向右绕行":
+                dirs = ['right']
+            else:
+                dirs = ['left', 'right']
             for d in dirs:
-                off_start, off_end = get_offset_segment(P_start, P_end, offset_m, d)
-                # 检查是否与任何活跃障碍物相交
+                off_start, off_end = get_offset_points(P_start, P_end, offset_m, d)
+                # 检查偏移线段是否与任何缓冲区相交
                 intersect = False
-                for obs2 in active_obstacles:
-                    p2 = obs2.get("polygon", [])
-                    if p2 and len(p2) >= 3:
-                        if line_intersects_polygon(off_start, off_end, p2):
-                            intersect = True
-                            break
+                for buf in buffer_zones:
+                    if buf and line_intersects_polygon(off_start, off_end, buf):
+                        intersect = True
+                        break
                 if not intersect:
-                    best_off_start, best_off_end = off_start, off_end
+                    best_offset_start, best_offset_end = off_start, off_end
                     success = True
                     break
             if success:
                 break
             offset_m += safe_radius
         if success:
-            path.append(best_off_start)
-            path.append(best_off_end)
+            path.append(best_offset_start)
+            path.append(best_offset_end)
             path.append(P_end)
             current_t = t_end
         else:
-            # 无法绕行，直接跳到 P_end
             path.append(P_end)
             current_t = t_end
-    
-    # 添加终点
     if distance_meters(path[-1], B) > 1e-6:
         path.append(B)
-    
     # 简化路径（去除共线点）
     simplified = [path[0]]
     for i in range(1, len(path)-1):
@@ -344,7 +356,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 绕行后自动回到原始直线")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 使用缓冲区检测，绕行更安全")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
