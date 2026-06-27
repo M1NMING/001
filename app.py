@@ -1,4 +1,4 @@
-# app.py - 最终完整版（多障碍物依次绕行 + 出口安全延伸）
+# app.py - 最终稳定版（多障碍物连续绕行 + 出口安全延伸）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -198,7 +198,7 @@ def point_on_polygon_boundary(point, polygon_coords):
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（多障碍物依次绕行 + 出口延伸）====================
+# ==================== 核心航线规划（多障碍物连续绕行 + 出口延伸）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
@@ -214,6 +214,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
         path = [A]
         current = A
+        # 依次处理每个活跃障碍物
         for poly in active_obstacles:
             buf_coords = get_buffer_polygon(poly, safe_radius, ref_point)
             if not buf_coords or len(buf_coords) < 4:
@@ -281,12 +282,11 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             for pt in boundary_points:
                 if distance_meters(path[-1], pt) > 0.1:
                     path.append(pt)
-            # 出口延伸
+            # 出口延伸：确保从出口到B的直线不与当前缓冲区相交
             exit_point = boundary_points[-1] if boundary_points else P_end
             extend_step = safe_radius * 2
             max_extend = total_len
             total_extended = 0
-            # 检查从exit_point到B的直线是否与当前缓冲区相交，若是则继续沿边界走
             while line_intersects_polygon(exit_point, B, buf_coords) and total_extended < max_extend:
                 _, current_dist = point_on_polygon_boundary(exit_point, buf_coords)
                 if use_cw:
@@ -302,13 +302,13 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 if distance_meters(path[-1], exit_point) > 0.1:
                     path.append(exit_point)
                 total_extended += extend_step
-            # 确保退出点被添加
             if distance_meters(path[-1], exit_point) > 0.1:
                 path.append(exit_point)
             current = exit_point
+        # 最终连接到B
         if distance_meters(current, B) > 0.1:
             path.append(B)
-        # 简化路径
+        # 简化路径（去除共线点）
         simplified = [path[0]]
         for i in range(1, len(path)-1):
             p1 = simplified[-1]
@@ -384,7 +384,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 可切换街道图 | 多障碍物依次绕行 + 出口安全延伸")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 可切换街道图 | 多障碍物连续绕行，出口安全延伸")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
