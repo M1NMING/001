@@ -1,4 +1,4 @@
-# app.py - 最终版（沿原直线，仅在障碍物处绕行并回正）
+# app.py - 最终稳定版（直线飞行 + 安全距离自动修正）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -116,60 +116,6 @@ def save_obstacles(obstacles):
         json.dump(to_save, f, ensure_ascii=False, indent=2)
 
 # ==================== 几何辅助函数 ====================
-def line_intersects_polygon(A, B, polygon):
-    if not polygon or len(polygon) < 3:
-        return False
-    line = LineString([A, B])
-    poly = Polygon(polygon)
-    return line.intersects(poly)
-
-def get_line_polygon_intersection_points(A, B, polygon):
-    """返回线段与多边形的两个交点（进入点和离开点），按从A到B的顺序"""
-    line = LineString([A, B])
-    poly = Polygon(polygon)
-    if not line.intersects(poly):
-        return None, None
-    intersection = line.intersection(poly)
-    if intersection.is_empty:
-        return None, None
-    points = []
-    if intersection.geom_type == 'Point':
-        points = [(intersection.x, intersection.y)]
-    elif intersection.geom_type == 'MultiPoint':
-        points = [(pt.x, pt.y) for pt in intersection.geoms]
-    elif intersection.geom_type == 'LineString':
-        coords = list(intersection.coords)
-        points = [(c[0], c[1]) for c in coords]
-    elif intersection.geom_type == 'MultiLineString':
-        # 取所有线段的端点
-        for geom in intersection.geoms:
-            coords = list(geom.coords)
-            points.extend([(c[0], c[1]) for c in coords])
-    else:
-        # 其他情况，取几何体的边界点
-        try:
-            coords = list(intersection.exterior.coords) if intersection.geom_type == 'Polygon' else []
-            points = [(c[0], c[1]) for c in coords]
-        except:
-            pass
-    if not points:
-        return None, None
-    # 按距离A排序
-    def dist(p):
-        return math.hypot(p[0]-A[0], p[1]-A[1])
-    points.sort(key=dist)
-    # 去重（近似）
-    unique = []
-    for p in points:
-        if not unique or distance_meters(p, unique[-1]) > 1e-3:
-            unique.append(p)
-    if len(unique) >= 2:
-        return unique[0], unique[-1]
-    elif len(unique) == 1:
-        return unique[0], None
-    else:
-        return None, None
-
 def distance_meters(p1, p2):
     lat_rad = math.radians((p1[1] + p2[1]) / 2)
     meter_per_deg_lon = 111320 * math.cos(lat_rad)
@@ -178,220 +124,102 @@ def distance_meters(p1, p2):
     dy = (p2[1] - p1[1]) * meter_per_deg_lat
     return math.hypot(dx, dy)
 
-def interpolate_point_on_line(A, B, distance_from_A_meters):
+def interpolate_line_points(A, B, step_meters=2.0):
+    """在A到B之间生成一系列点，点间距约 step_meters 米"""
     total_dist = distance_meters(A, B)
-    if total_dist < 1e-6:
-        return A
-    t = distance_from_A_meters / total_dist
-    t = max(0.0, min(1.0, t))
-    return (A[0] + t * (B[0] - A[0]), A[1] + t * (B[1] - A[1]))
+    if total_dist < step_meters:
+        return [A, B]
+    num_points = max(2, int(total_dist / step_meters) + 1)
+    points = []
+    for i in range(num_points):
+        t = i / (num_points - 1)
+        pt = (A[0] + t * (B[0] - A[0]), A[1] + t * (B[1] - A[1]))
+        points.append(pt)
+    return points
 
-def get_offset_points_with_start(start_point, B, offset_meters, direction='left'):
-    dx = B[0] - start_point[0]
-    dy = B[1] - start_point[1]
-    length = math.hypot(dx, dy)
-    if length == 0:
-        return start_point, B
-    ux = dx / length
-    uy = dy / length
-    perp_x = -uy
-    perp_y = ux
-    if direction == 'right':
-        perp_x = -perp_x
-        perp_y = -perp_y
-    lat_rad = math.radians((start_point[1] + B[1]) / 2)
+def point_to_polygon_distance(point, polygon):
+    p = Point(point[0], point[1])
+    poly = Polygon(polygon)
+    return p.distance(poly)
+
+def move_point_away(point, polygon, safe_radius):
+    """将点沿远离多边形的方向移动，直到距离为 safe_radius + 0.5"""
+    p = Point(point[0], point[1])
+    poly = Polygon(polygon)
+    if p.distance(poly) >= safe_radius:
+        return point
+    nearest = nearest_points(p, poly)[1]
+    dx = point[0] - nearest.x
+    dy = point[1] - nearest.y
+    dist = math.hypot(dx, dy)
+    if dist < 1e-10:
+        # 点在多边形内部，无法确定方向，随机移动一个方向
+        dx, dy = 1.0, 0.0
+        dist = 1.0
+    # 需要移动的距离
+    need_move = safe_radius - p.distance(poly) + 0.5
+    lat_rad = math.radians(point[1])
     meter_per_deg_lon = 111320 * math.cos(lat_rad)
     meter_per_deg_lat = 110540
-    offset_lon = offset_meters / meter_per_deg_lon * perp_x
-    offset_lat = offset_meters / meter_per_deg_lat * perp_y
-    new_start = (start_point[0] + offset_lon, start_point[1] + offset_lat)
-    new_end = (B[0] + offset_lon, B[1] + offset_lat)
-    return new_start, new_end
+    offset_lon = need_move / meter_per_deg_lon * (dx / dist)
+    offset_lat = need_move / meter_per_deg_lat * (dy / dist)
+    new_point = (point[0] + offset_lon, point[1] + offset_lat)
+    return new_point
 
-def get_buffer_polygon(polygon, safe_radius, ref_point):
-    if not polygon or len(polygon) < 3:
-        return None
-    center_lng, center_lat = ref_point
-    meter_per_deg_lon = 111320 * math.cos(math.radians(center_lat))
-    meter_per_deg_lat = 110540
-    local_points = []
-    for p in polygon:
-        dx = (p[0] - center_lng) * meter_per_deg_lon
-        dy = (p[1] - center_lat) * meter_per_deg_lat
-        local_points.append((dx, dy))
-    local_poly = Polygon(local_points)
-    buffered = local_poly.buffer(safe_radius)
-    buffered_coords = []
-    for pt in buffered.exterior.coords:
-        lng = center_lng + pt[0] / meter_per_deg_lon
-        lat = center_lat + pt[1] / meter_per_deg_lat
-        buffered_coords.append((lng, lat))
-    return buffered_coords
-
-def enforce_safe_distance(path, obstacles, safe_radius):
-    if not obstacles or not path:
-        return path
-    poly_list = []
-    for obs in obstacles:
-        poly = obs.get("polygon", [])
-        if poly and len(poly) >= 3:
-            poly_list.append(Polygon(poly))
-    if not poly_list:
-        return path
-    for _ in range(3):
-        new_path = []
-        for pt in path:
-            point = Point(pt[0], pt[1])
-            min_dist = float('inf')
-            nearest_poly = None
-            for poly in poly_list:
-                d = point.distance(poly)
-                if d < min_dist:
-                    min_dist = d
-                    nearest_poly = poly
-            if min_dist < safe_radius and nearest_poly is not None:
-                nearest_pt = nearest_points(point, nearest_poly)[1]
-                dx = pt[0] - nearest_pt.x
-                dy = pt[1] - nearest_pt.y
-                length = math.hypot(dx, dy)
-                if length > 1e-8:
-                    lat_rad = math.radians(pt[1])
-                    meter_per_deg_lon = 111320 * math.cos(lat_rad)
-                    meter_per_deg_lat = 110540
-                    offset_lon = (safe_radius - min_dist + 0.5) / meter_per_deg_lon * (dx / length)
-                    offset_lat = (safe_radius - min_dist + 0.5) / meter_per_deg_lat * (dy / length)
-                    new_pt = (pt[0] + offset_lon, pt[1] + offset_lat)
-                    new_path.append(new_pt)
-                else:
-                    new_path.append(pt)
-            else:
-                new_path.append(pt)
-        path = new_path
-    return path
-
-# ==================== 核心航线规划（沿原直线，仅在障碍物处绕行并回正）====================
+# ==================== 核心航线规划 ====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
-    if not obstacles:
-        return [A, B]
-    # 预计算原始直线
-    raw_path = [A, B]
-    # 检测所有与直线相交且需要绕行的障碍物，按距离A排序
-    hit_obstacles = []
+    """
+    生成从A到B的路径，初始为直线，然后通过迭代修正，使所有路径点与障碍物的距离 >= safe_radius。
+    若飞行高度 > 障碍物高度，则不考虑该障碍物（飞跃）。
+    """
+    # 筛选需要避障的障碍物（飞行高度 <= 障碍物高度）
+    active_obstacles = []
     for obs in obstacles:
         poly = obs.get("polygon", [])
-        if not poly or len(poly) < 3:
-            continue
         height = obs.get("height", 10.0)
-        if flight_height <= height and line_intersects_polygon(A, B, poly):
-            # 获取进入点和离开点
-            entry, exit_pt = get_line_polygon_intersection_points(A, B, poly)
-            if entry is not None:
-                hit_obstacles.append({
-                    'obs': obs,
-                    'poly': poly,
-                    'entry': entry,
-                    'exit': exit_pt,
-                    'dist_entry': distance_meters(A, entry)
-                })
-    # 按进入点排序
-    hit_obstacles.sort(key=lambda x: x['dist_entry'])
-    # 构建路径：逐段拼接直线和绕行段
-    path = [A]
-    current = A
-    for idx, hit in enumerate(hit_obstacles):
-        entry = hit['entry']
-        exit_pt = hit['exit']
-        # 从 current 直线前进到 entry 前 safe_radius 处（绕行起点）
-        dist_to_entry = distance_meters(current, entry)
-        if dist_to_entry > safe_radius:
-            start_offset = max(0.0, dist_to_entry - safe_radius)
-            start_point = interpolate_point_on_line(current, B, start_offset)
-        else:
-            start_point = current
-        # 如果起点与当前点不同，添加直线段
-        if distance_meters(current, start_point) > 1e-6:
-            path.append(start_point)
-        # 生成绕行段：从 start_point 到 exit_pt 后 safe_radius 处的点（绕行终点）
-        # 先计算 exit_pt 后 safe_radius 处的点
-        dist_exit_to_B = distance_meters(exit_pt, B)
-        if dist_exit_to_B > safe_radius:
-            end_offset = min(dist_exit_to_B, safe_radius)
-            end_point = interpolate_point_on_line(exit_pt, B, end_offset)
-        else:
-            end_point = B
-        # 在 start_point 到 end_point 之间生成偏移路径，偏移距离从 safe_radius*3 开始逐步增加
-        offset_m = safe_radius * 3
-        success = False
-        best_start, best_end = None, None
-        for attempt in range(40):
-            if strategy == "向左绕行":
-                dirs = ['left']
-            elif strategy == "向右绕行":
-                dirs = ['right']
-            else:
-                dirs = ['left', 'right']
-            for d in dirs:
-                # 生成偏移线段，从 start_point 到 end_point
-                off_start, off_end = get_offset_points_with_start(start_point, end_point, offset_m, d)
-                # 检查偏移线段是否与任何障碍物（原始多边形）相交（用缓冲区检测更好）
-                # 但这里用原始多边形检测，因为偏移后的路径需要避开障碍物本身
-                intersect = False
-                for obs2 in obstacles:
-                    p2 = obs2.get("polygon", [])
-                    if p2 and len(p2) >= 3:
-                        if line_intersects_polygon(off_start, off_end, p2):
-                            intersect = True
-                            break
-                if not intersect:
-                    # 进一步检查与障碍物缓冲区的距离（确保安全距离）
-                    safe = True
-                    for obs2 in obstacles:
-                        p2 = obs2.get("polygon", [])
-                        if p2 and len(p2) >= 3:
-                            # 检查 off_start 和 off_end 到多边形距离
-                            poly_shapely = Polygon(p2)
-                            if Point(off_start[0], off_start[1]).distance(poly_shapely) < safe_radius:
-                                safe = False
-                                break
-                            if Point(off_end[0], off_end[1]).distance(poly_shapely) < safe_radius:
-                                safe = False
-                                break
-                    if safe:
-                        best_start, best_end = off_start, off_end
-                        success = True
-                        break
-            if success:
-                break
-            offset_m += safe_radius
-        if success:
-            path.append(best_start)
-            # 从 best_end 到终点 B 可能会经过其他障碍物，但我们将继续循环处理
-            # 将 current 设为 best_end，继续处理后续障碍物（但后续障碍物已经在 hit_obstacles 中，我们将跳过已处理的）
-            current = best_end
-        else:
-            # 无法绕行，直接跳到 B
-            path.append(B)
+        if poly and len(poly) >= 3 and flight_height <= height:
+            active_obstacles.append(obs)
+    if not active_obstacles:
+        return [A, B]
+    # 生成初始直线上的密集点（间距2米）
+    raw_points = interpolate_line_points(A, B, step_meters=2.0)
+    # 迭代修正
+    max_iter = 10
+    for _ in range(max_iter):
+        modified = False
+        new_points = []
+        for pt in raw_points:
+            # 检查到所有障碍物的距离
+            need_move = False
+            for obs in active_obstacles:
+                poly = obs.get("polygon", [])
+                if not poly:
+                    continue
+                dist = point_to_polygon_distance(pt, poly)
+                if dist < safe_radius:
+                    # 移动该点
+                    new_pt = move_point_away(pt, poly, safe_radius)
+                    new_points.append(new_pt)
+                    modified = True
+                    need_move = True
+                    break
+            if not need_move:
+                new_points.append(pt)
+        raw_points = new_points
+        if not modified:
             break
-        # 如果当前绕行段的终点已经接近 B，结束
-        if distance_meters(current, B) < 1e-6:
-            break
-    # 如果最后没有到达 B，添加直线段
-    if distance_meters(current, B) > 1e-6:
-        path.append(B)
-    # 简化路径
-    simplified = [path[0]]
-    for i in range(1, len(path)-1):
+    # 简化路径（去除共线点）
+    simplified = [raw_points[0]]
+    for i in range(1, len(raw_points)-1):
         p1 = simplified[-1]
-        p2 = path[i]
-        p3 = path[i+1]
+        p2 = raw_points[i]
+        p3 = raw_points[i+1]
         if abs((p2[0]-p1[0])*(p3[1]-p2[1]) - (p2[1]-p1[1])*(p3[0]-p2[0])) > 1e-8:
             simplified.append(p2)
-    simplified.append(path[-1])
-    # 后处理：确保每个点距离障碍物至少 safe_radius
-    final_path = enforce_safe_distance(simplified, obstacles, safe_radius)
-    return final_path
+    simplified.append(raw_points[-1])
+    return simplified
 
-# ==================== 创建地图 ====================
+# ==================== 创建地图（Esri卫星图 + OSM备选）====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
     m = folium.Map(
         location=[center_lat, center_lng],
@@ -454,7 +282,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 沿原直线，障碍物处绕行并回正")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 航线自动保持安全距离，遇障平滑绕行")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
