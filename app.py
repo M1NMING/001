@@ -126,7 +126,7 @@ def distance_meters(p1, p2):
 def interpolate_point_on_line(A, B, t):
     return (A[0] + t * (B[0] - A[0]), A[1] + t * (B[1] - A[1]))
 
-def get_offset_points(A, B, offset_meters, direction='left'):
+def get_offset_segment(A, B, offset_meters, direction='left'):
     dx = B[0] - A[0]
     dy = B[1] - A[1]
     length = math.hypot(dx, dy)
@@ -184,51 +184,64 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             active_obstacles.append(obs)
     if not active_obstacles:
         return [A, B]
+    
     path = [A]
     current_t = 0.0
-    for obs in active_obstacles:
+    dist_AB = distance_meters(A, B)
+    if dist_AB < 1e-6:
+        return [A, B]
+    
+    # 处理每个障碍物，按在直线上出现的顺序排序
+    obstacle_intervals = []
+    for idx, obs in enumerate(active_obstacles):
         poly = obs.get("polygon", [])
-        intersections = get_line_polygon_intersection_points(A, B, poly)
-        if not intersections:
+        pts = get_line_polygon_intersection_points(A, B, poly)
+        if not pts:
             continue
-        t_values = []
-        dist_AB = distance_meters(A, B)
-        for pt in intersections:
-            dist_pt_A = distance_meters(A, pt)
-            if dist_AB < 1e-8:
-                continue
-            t = dist_pt_A / dist_AB
-            t_values.append(t)
-        if not t_values:
+        t_vals = []
+        for pt in pts:
+            t = distance_meters(A, pt) / dist_AB
+            t_vals.append(t)
+        if not t_vals:
             continue
-        t_enter = min(t_values)
-        t_exit = max(t_values)
-        if t_exit <= current_t:
+        t_min = min(t_vals)
+        t_max = max(t_vals)
+        obstacle_intervals.append((t_min, t_max, idx, obs))
+    # 按 t_min 排序
+    obstacle_intervals.sort(key=lambda x: x[0])
+    
+    for t_min, t_max, idx, obs in obstacle_intervals:
+        if t_max <= current_t:
             continue
+        # 绕行窗口从 t_start 到 t_end (加上安全距离)
         margin = safe_radius / dist_AB
-        t_start = max(current_t, t_enter - margin)
-        t_end = min(1.0, t_exit + margin)
+        t_start = max(current_t, t_min - margin)
+        t_end = min(1.0, t_max + margin)
         if t_end - t_start < 0.01:
-            t_start = max(current_t, t_enter - 0.02)
-            t_end = min(1.0, t_exit + 0.02)
+            t_start = max(current_t, t_min - 0.02)
+            t_end = min(1.0, t_max + 0.02)
         P_start = interpolate_point_on_line(A, B, t_start)
         P_end = interpolate_point_on_line(A, B, t_end)
-        if len(path) > 0 and distance_meters(path[-1], P_start) < 1e-6:
-            pass
-        else:
+        
+        # 如果路径末尾不是 P_start，则添加 P_start
+        if len(path) > 0 and distance_meters(path[-1], P_start) > 1e-6:
             path.append(P_start)
+        
+        # 生成偏移段
         offset_m = safe_radius * 4
         success = False
-        best_offset_start, best_offset_end = None, None
+        best_off_start, best_off_end = None, None
+        # 根据策略尝试左右方向
+        if strategy == "向左绕行":
+            dirs = ['left']
+        elif strategy == "向右绕行":
+            dirs = ['right']
+        else:
+            dirs = ['left', 'right']
         for attempt in range(30):
-            if strategy == "向左绕行":
-                dirs = ['left']
-            elif strategy == "向右绕行":
-                dirs = ['right']
-            else:
-                dirs = ['left', 'right']
             for d in dirs:
-                off_start, off_end = get_offset_points(P_start, P_end, offset_m, d)
+                off_start, off_end = get_offset_segment(P_start, P_end, offset_m, d)
+                # 检查是否与任何活跃障碍物相交
                 intersect = False
                 for obs2 in active_obstacles:
                     p2 = obs2.get("polygon", [])
@@ -237,22 +250,27 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                             intersect = True
                             break
                 if not intersect:
-                    best_offset_start, best_offset_end = off_start, off_end
+                    best_off_start, best_off_end = off_start, off_end
                     success = True
                     break
             if success:
                 break
             offset_m += safe_radius
         if success:
-            path.append(best_offset_start)
-            path.append(best_offset_end)
+            path.append(best_off_start)
+            path.append(best_off_end)
             path.append(P_end)
             current_t = t_end
         else:
+            # 无法绕行，直接跳到 P_end
             path.append(P_end)
             current_t = t_end
+    
+    # 添加终点
     if distance_meters(path[-1], B) > 1e-6:
         path.append(B)
+    
+    # 简化路径（去除共线点）
     simplified = [path[0]]
     for i in range(1, len(path)-1):
         p1 = simplified[-1]
@@ -512,4 +530,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
