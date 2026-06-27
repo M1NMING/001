@@ -1,4 +1,4 @@
-# app.py - 完整修复版（绕行出口安全延伸）
+# app.py - 最终完整版（多障碍物依次绕行 + 出口安全延伸）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -198,7 +198,7 @@ def point_on_polygon_boundary(point, polygon_coords):
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（绕行出口安全延伸）====================
+# ==================== 核心航线规划（多障碍物依次绕行 + 出口延伸）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
@@ -218,10 +218,9 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             buf_coords = get_buffer_polygon(poly, safe_radius, ref_point)
             if not buf_coords or len(buf_coords) < 4:
                 continue
-            # 检查当前点到终点的直线是否与缓冲区相交
+            # 检测当前到终点的直线是否与缓冲区相交
             if not line_intersects_polygon(current, B, buf_coords):
                 continue
-            # 获取交点
             pts = get_line_polygon_intersection_points(current, B, buf_coords)
             if not pts:
                 continue
@@ -250,7 +249,6 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             else:
                 dist_ccw = start_dist - end_dist
                 dist_cw = total_len - dist_ccw
-            # 绕行方向
             if strategy == "向左绕行":
                 use_cw = True
             elif strategy == "向右绕行":
@@ -283,18 +281,14 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             for pt in boundary_points:
                 if distance_meters(path[-1], pt) > 0.1:
                     path.append(pt)
-            # 绕行出口为最后一个边界点（即P_end）
+            # 出口延伸
             exit_point = boundary_points[-1] if boundary_points else P_end
-            # 检查从exit_point到B的直线是否与当前缓冲区相交，若相交则沿边界继续延伸
-            # 检测是否需要延伸
-            extend_step = safe_radius * 2  # 每次延伸距离
-            max_extend = total_len  # 防止无限循环
+            extend_step = safe_radius * 2
+            max_extend = total_len
             total_extended = 0
+            # 检查从exit_point到B的直线是否与当前缓冲区相交，若是则继续沿边界走
             while line_intersects_polygon(exit_point, B, buf_coords) and total_extended < max_extend:
-                # 沿当前方向继续走 extend_step
-                # 获取当前点在边界上的投影距离
                 _, current_dist = point_on_polygon_boundary(exit_point, buf_coords)
-                # 根据方向增加距离
                 if use_cw:
                     new_dist = current_dist + extend_step
                     if new_dist > total_len:
@@ -303,14 +297,12 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                     new_dist = current_dist - extend_step
                     if new_dist < 0:
                         new_dist += total_len
-                # 获取新点
                 new_pt = ring.interpolate(new_dist)
                 exit_point = (new_pt.x, new_pt.y)
-                # 添加到路径（如果与上一个点距离够远）
                 if distance_meters(path[-1], exit_point) > 0.1:
                     path.append(exit_point)
                 total_extended += extend_step
-            # 添加出口点（可能已经添加）
+            # 确保退出点被添加
             if distance_meters(path[-1], exit_point) > 0.1:
                 path.append(exit_point)
             current = exit_point
@@ -392,7 +384,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 可切换街道图 | 绕行后沿边界延伸确保安全距离")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 可切换街道图 | 多障碍物依次绕行 + 出口安全延伸")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
