@@ -1,4 +1,4 @@
-# app.py - 合并障碍物缓冲区整体绕行（异常防护版）
+# app.py - 合并障碍物缓冲区整体绕行（健壮版）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -10,7 +10,7 @@ from datetime import datetime
 from streamlit_folium import st_folium
 import folium
 from folium import plugins
-from shapely.geometry import Polygon, Point, LineString, MultiPolygon
+from shapely.geometry import Polygon, Point, LineString, MultiPolygon, GeometryCollection
 from shapely.ops import unary_union, substring
 from shapely.affinity import translate
 
@@ -165,8 +165,18 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         local_points.append((dx, dy))
     local_poly = Polygon(local_points)
     buffered = local_poly.buffer(safe_radius, resolution=8)
+    if buffered.is_empty:
+        return None
+    # 提取外环坐标并确保首尾闭合
+    exterior = buffered.exterior
+    coords = list(exterior.coords)
+    if len(coords) < 4:
+        return None
+    # 确保首尾相同
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
     buffered_coords = []
-    for pt in buffered.exterior.coords:
+    for pt in coords:
         lng = center_lng + pt[0] / meter_per_deg_lon
         lat = center_lat + pt[1] / meter_per_deg_lat
         buffered_coords.append((lng, lat))
@@ -179,7 +189,7 @@ def point_on_polygon_boundary(point, polygon_coords):
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（合并障碍物整体绕行，异常捕获）====================
+# ==================== 核心航线规划（合并障碍物整体绕行，健壮版）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
@@ -193,42 +203,43 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                 active_obstacles.append(poly)
         if not active_obstacles:
             return [A, B]
-        # 合并所有障碍物的缓冲区
+        # 生成每个障碍物的缓冲区多边形
         ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
-        buffers = []
+        buffer_polys = []
         for poly in active_obstacles:
-            buf = get_buffer_polygon(poly, safe_radius, ref_point)
-            if buf:
-                buffers.append(Polygon(buf))
-        if not buffers:
+            buf_coords = get_buffer_polygon(poly, safe_radius, ref_point)
+            if buf_coords and len(buf_coords) >= 4:
+                try:
+                    buffer_polys.append(Polygon(buf_coords))
+                except:
+                    pass
+        if not buffer_polys:
             return [A, B]
-        # 合并缓冲区
-        merged = unary_union(buffers)
+        # 合并所有缓冲区
+        merged = unary_union(buffer_polys)
         if merged.is_empty:
             return [A, B]
-        # 如果合并后是MultiPolygon，取面积最大的多边形
+        # 确保合并后是有效的多边形
         if merged.geom_type == 'MultiPolygon':
+            # 取面积最大的多边形
             largest = max(merged.geoms, key=lambda p: p.area)
             merged = largest
-        # 获取合并后多边形的外环坐标
-        if merged.geom_type == 'Polygon':
-            exterior_coords = list(merged.exterior.coords)
-        else:
-            # 尝试提取边界
-            if hasattr(merged, 'boundary'):
-                boundary = merged.boundary
-                if boundary.geom_type == 'LineString':
-                    exterior_coords = list(boundary.coords)
-                else:
-                    exterior_coords = []
-            else:
-                exterior_coords = []
-        if not exterior_coords or len(exterior_coords) < 4:
+        elif merged.geom_type == 'GeometryCollection':
+            # 从中提取多边形
+            polygons = [g for g in merged.geoms if g.geom_type == 'Polygon']
+            if not polygons:
+                return [A, B]
+            merged = max(polygons, key=lambda p: p.area)
+        elif merged.geom_type != 'Polygon':
             return [A, B]
-        # 检查直线是否与合并后的区域相交
+        # 获取外环坐标
+        exterior_coords = list(merged.exterior.coords)
+        if len(exterior_coords) < 4:
+            return [A, B]
+        # 检查直线是否与合并区域相交
         if not line_intersects_polygon(A, B, exterior_coords):
             return [A, B]
-        # 获取入点和出点
+        # 获取交点
         intersections = get_line_polygon_intersection_points(A, B, exterior_coords)
         if not intersections:
             return [A, B]
@@ -306,7 +317,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         simplified.append(path[-1])
         return simplified
     except Exception as e:
-        # 任何错误都返回直线路径，保证地图显示
+        # 任何错误都返回直线路径
         return [A, B]
 
 # ==================== 创建地图 ====================
@@ -372,7 +383,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 合并障碍物整体绕行，异常时降级为直线")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 合并障碍物整体绕行，保持5米安全距离")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
