@@ -1,4 +1,4 @@
-# app.py - 沿障碍物边缘绕行（单障碍物边界投影，稳定版）
+# app.py - 沿障碍物边缘平行绕行（安全距离5米）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -152,6 +152,7 @@ def get_line_polygon_intersection_points(A, B, polygon):
     return points
 
 def get_buffer_polygon(polygon, safe_radius, ref_point):
+    """生成障碍物的安全缓冲区（向外扩展 safe_radius 米）"""
     if not polygon or len(polygon) < 3:
         return None
     center_lng, center_lat = ref_point
@@ -163,7 +164,7 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
         dy = (p[1] - center_lat) * meter_per_deg_lat
         local_points.append((dx, dy))
     local_poly = Polygon(local_points)
-    buffered = local_poly.buffer(safe_radius, resolution=8)
+    buffered = local_poly.buffer(safe_radius, resolution=12)  # 提高分辨率使边界更平滑
     if buffered.is_empty:
         return None
     exterior = buffered.exterior
@@ -180,18 +181,19 @@ def get_buffer_polygon(polygon, safe_radius, ref_point):
     return buffered_coords
 
 def point_on_polygon_boundary(point, polygon_coords):
+    """将点投影到多边形边界上，返回边界上的点及其弧长参数"""
     ring = LinearRing(polygon_coords)
     pt = Point(point[0], point[1])
     project_dist = ring.project(pt)
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（沿障碍物边缘绕行）====================
+# ==================== 核心航线规划（沿障碍物边缘平行绕行）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
     try:
         if not obstacles:
             return [A, B]
-        # 筛选活跃障碍物
+        # 筛选飞行高度不足的障碍物（需绕行）
         active_obstacles = []
         for obs in obstacles:
             poly = obs.get("polygon", [])
@@ -203,28 +205,27 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
         path = [A]
         current = A
-        # 对每个活跃障碍物依次处理
+        # 依次处理每个活跃障碍物
         for poly in active_obstacles:
-            # 生成缓冲区
+            # 生成缓冲区（即安全距离轮廓）
             buf_coords = get_buffer_polygon(poly, safe_radius, ref_point)
             if not buf_coords or len(buf_coords) < 4:
-                # 缓冲区生成失败，跳过该障碍物（可能直线穿过，但会由下一个障碍物处理）
-                continue
+                continue  # 无法生成缓冲区则跳过
             # 检查当前点到终点的直线是否与缓冲区相交
             if not line_intersects_polygon(current, B, buf_coords):
-                continue  # 不影响当前直线，继续
-            # 获取与缓冲区的交点
+                continue  # 不影响，继续直线
+            # 获取交点（入点和出点）
             pts = get_line_polygon_intersection_points(current, B, buf_coords)
             if not pts:
                 continue
-            # 计算t值并排序
             dist_AB = distance_meters(current, B)
             if dist_AB < 1e-8:
                 continue
+            # 按距current的距离排序t值
             t_vals = [distance_meters(current, pt) / dist_AB for pt in pts]
             t_enter = min(t_vals)
             t_exit = max(t_vals)
-            # 扩展绕行窗口（提前入、延后出）
+            # 扩展绕行窗口（提前入、延后出，使航线更平滑）
             margin = safe_radius / dist_AB * 1.5
             t_start = max(0.0, t_enter - margin)
             t_end = min(1.0, t_exit + margin)
@@ -238,20 +239,21 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
             end_on_buf, end_dist = point_on_polygon_boundary(P_end, buf_coords)
             ring = LinearRing(buf_coords)
             total_len = ring.length
+            # 计算顺时针和逆时针沿边界的距离
             if end_dist >= start_dist:
                 dist_cw = end_dist - start_dist
                 dist_ccw = total_len - dist_cw
             else:
                 dist_ccw = start_dist - end_dist
                 dist_cw = total_len - dist_ccw
-            # 绕行方向
+            # 绕行方向选择
             if strategy == "向左绕行":
-                use_cw = True
+                use_cw = True  # 顺时针
             elif strategy == "向右绕行":
-                use_cw = False
-            else:
+                use_cw = False  # 逆时针
+            else:  # 最佳航线
                 use_cw = (dist_cw <= dist_ccw)
-            # 生成边界采样点（步长2米）
+            # 沿边界采样（步长2米）
             step_meters = 2.0
             chosen_dist = dist_cw if use_cw else dist_ccw
             num_steps = max(2, int(chosen_dist / step_meters))
@@ -272,21 +274,20 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
                         dist += total_len
                     pt = ring.interpolate(dist)
                     boundary_points.append((pt.x, pt.y))
-            # 构建路径段：从current到P_start（直线），然后边界点，最后到P_end（直线）
-            # 但注意，current可能已经在之前被更新为上一次绕行的终点，所以我们需要从current到P_start
+            # 构建路径段
             if distance_meters(current, P_start) > 0.1:
                 path.append(P_start)
-            # 添加边界点（跳过与起点终点重复的点）
+            # 添加边界点（去重）
             for pt in boundary_points:
                 if distance_meters(path[-1], pt) > 0.1:
                     path.append(pt)
             if distance_meters(path[-1], P_end) > 0.1:
                 path.append(P_end)
-            current = P_end  # 更新当前点为绕行终点
-        # 最后连接到B
+            current = P_end  # 更新当前位置
+        # 最后连接到终点B
         if distance_meters(current, B) > 0.1:
             path.append(B)
-        # 简化路径
+        # 简化路径（去除共线点）
         simplified = [path[0]]
         for i in range(1, len(path)-1):
             p1 = simplified[-1]
@@ -297,7 +298,7 @@ def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy
         simplified.append(path[-1])
         return simplified
     except Exception as e:
-        # 任何错误返回直线
+        # 任何错误降级为直线
         return [A, B]
 
 # ==================== 创建地图 ====================
@@ -363,7 +364,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 沿障碍物边缘绕行（5米安全距离）")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 航线与障碍物边缘平行，保持5米安全距离")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
