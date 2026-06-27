@@ -1,4 +1,4 @@
-# app.py - 合并障碍物缓冲区整体绕行版
+# app.py - 合并障碍物缓冲区整体绕行（异常防护版）
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -179,132 +179,135 @@ def point_on_polygon_boundary(point, polygon_coords):
     boundary_point = ring.interpolate(project_dist)
     return (boundary_point.x, boundary_point.y), project_dist
 
-# ==================== 核心航线规划（合并障碍物整体绕行）====================
+# ==================== 核心航线规划（合并障碍物整体绕行，异常捕获）====================
 def compute_avoidance_path(A, B, obstacles, flight_height, safe_radius, strategy):
-    if not obstacles:
+    try:
+        if not obstacles:
+            return [A, B]
+        # 筛选活跃障碍物
+        active_obstacles = []
+        for obs in obstacles:
+            poly = obs.get("polygon", [])
+            height = obs.get("height", 10.0)
+            if poly and len(poly) >= 3 and flight_height <= height:
+                active_obstacles.append(poly)
+        if not active_obstacles:
+            return [A, B]
+        # 合并所有障碍物的缓冲区
+        ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
+        buffers = []
+        for poly in active_obstacles:
+            buf = get_buffer_polygon(poly, safe_radius, ref_point)
+            if buf:
+                buffers.append(Polygon(buf))
+        if not buffers:
+            return [A, B]
+        # 合并缓冲区
+        merged = unary_union(buffers)
+        if merged.is_empty:
+            return [A, B]
+        # 如果合并后是MultiPolygon，取面积最大的多边形
+        if merged.geom_type == 'MultiPolygon':
+            largest = max(merged.geoms, key=lambda p: p.area)
+            merged = largest
+        # 获取合并后多边形的外环坐标
+        if merged.geom_type == 'Polygon':
+            exterior_coords = list(merged.exterior.coords)
+        else:
+            # 尝试提取边界
+            if hasattr(merged, 'boundary'):
+                boundary = merged.boundary
+                if boundary.geom_type == 'LineString':
+                    exterior_coords = list(boundary.coords)
+                else:
+                    exterior_coords = []
+            else:
+                exterior_coords = []
+        if not exterior_coords or len(exterior_coords) < 4:
+            return [A, B]
+        # 检查直线是否与合并后的区域相交
+        if not line_intersects_polygon(A, B, exterior_coords):
+            return [A, B]
+        # 获取入点和出点
+        intersections = get_line_polygon_intersection_points(A, B, exterior_coords)
+        if not intersections:
+            return [A, B]
+        dist_AB = distance_meters(A, B)
+        if dist_AB < 1e-8:
+            return [A, B]
+        t_values = [distance_meters(A, pt) / dist_AB for pt in intersections]
+        t_enter = min(t_values)
+        t_exit = max(t_values)
+        margin = safe_radius / dist_AB * 1.5
+        t_start = max(0.0, t_enter - margin)
+        t_end = min(1.0, t_exit + margin)
+        if t_end - t_start < 0.01:
+            t_start = max(0.0, t_enter - 0.03)
+            t_end = min(1.0, t_exit + 0.03)
+        P_start = interpolate_point_on_line(A, B, t_start)
+        P_end = interpolate_point_on_line(A, B, t_end)
+        # 投影到边界
+        start_on_buf, start_dist = point_on_polygon_boundary(P_start, exterior_coords)
+        end_on_buf, end_dist = point_on_polygon_boundary(P_end, exterior_coords)
+        ring = LinearRing(exterior_coords)
+        total_len = ring.length
+        if end_dist >= start_dist:
+            dist_cw = end_dist - start_dist
+            dist_ccw = total_len - dist_cw
+        else:
+            dist_ccw = start_dist - end_dist
+            dist_cw = total_len - dist_ccw
+        if strategy == "向左绕行":
+            use_cw = True
+        elif strategy == "向右绕行":
+            use_cw = False
+        else:
+            use_cw = (dist_cw <= dist_ccw)
+        # 生成边界点
+        step_meters = 2.0
+        chosen_dist = dist_cw if use_cw else dist_ccw
+        num_steps = max(2, int(chosen_dist / step_meters))
+        boundary_points = []
+        if use_cw:
+            for i in range(num_steps + 1):
+                frac = i / num_steps
+                dist = start_dist + frac * dist_cw
+                if dist > total_len:
+                    dist -= total_len
+                pt = ring.interpolate(dist)
+                boundary_points.append((pt.x, pt.y))
+        else:
+            for i in range(num_steps + 1):
+                frac = i / num_steps
+                dist = start_dist - frac * dist_ccw
+                if dist < 0:
+                    dist += total_len
+                pt = ring.interpolate(dist)
+                boundary_points.append((pt.x, pt.y))
+        # 构建路径
+        path = [A]
+        if distance_meters(path[-1], P_start) > 0.1:
+            path.append(P_start)
+        for pt in boundary_points:
+            if distance_meters(path[-1], pt) > 0.1:
+                path.append(pt)
+        if distance_meters(path[-1], P_end) > 0.1:
+            path.append(P_end)
+        if distance_meters(path[-1], B) > 0.1:
+            path.append(B)
+        # 简化
+        simplified = [path[0]]
+        for i in range(1, len(path)-1):
+            p1 = simplified[-1]
+            p2 = path[i]
+            p3 = path[i+1]
+            if abs((p2[0]-p1[0])*(p3[1]-p2[1]) - (p2[1]-p1[1])*(p3[0]-p2[0])) > 1e-8:
+                simplified.append(p2)
+        simplified.append(path[-1])
+        return simplified
+    except Exception as e:
+        # 任何错误都返回直线路径，保证地图显示
         return [A, B]
-    # 筛选活跃障碍物
-    active_obstacles = []
-    for obs in obstacles:
-        poly = obs.get("polygon", [])
-        height = obs.get("height", 10.0)
-        if poly and len(poly) >= 3 and flight_height <= height:
-            active_obstacles.append(poly)
-    if not active_obstacles:
-        return [A, B]
-    # 合并所有障碍物的缓冲区
-    ref_point = ((A[0]+B[0])/2, (A[1]+B[1])/2)
-    buffers = []
-    for poly in active_obstacles:
-        buf = get_buffer_polygon(poly, safe_radius, ref_point)
-        if buf:
-            buffers.append(Polygon(buf))
-    if not buffers:
-        return [A, B]
-    # 合并缓冲区
-    merged = unary_union(buffers)
-    # 如果合并后是MultiPolygon，取最大的外环（或取凸包？但为了保险，取外边界）
-    if merged.geom_type == 'MultiPolygon':
-        # 取面积最大的多边形
-        largest = max(merged.geoms, key=lambda p: p.area)
-        merged = largest
-    # 获取合并后多边形的外环坐标
-    if merged.geom_type == 'Polygon':
-        exterior_coords = list(merged.exterior.coords)
-    else:
-        # 如果变成其他类型，尝试提取边界
-        exterior_coords = list(merged.boundary.coords) if hasattr(merged, 'boundary') else []
-    if not exterior_coords or len(exterior_coords) < 3:
-        return [A, B]
-    # 检查直线是否与合并后的区域相交
-    if not line_intersects_polygon(A, B, exterior_coords):
-        # 不相交则直接直线飞行
-        return [A, B]
-    # 获取入点和出点（直线与合并区域的交点）
-    intersections = get_line_polygon_intersection_points(A, B, exterior_coords)
-    if not intersections:
-        return [A, B]
-    # 计算t值
-    dist_AB = distance_meters(A, B)
-    if dist_AB < 1e-8:
-        return [A, B]
-    t_values = [distance_meters(A, pt) / dist_AB for pt in intersections]
-    t_enter = min(t_values)
-    t_exit = max(t_values)
-    # 绕行窗口：扩展margin
-    margin = safe_radius / dist_AB * 1.5
-    t_start = max(0.0, t_enter - margin)
-    t_end = min(1.0, t_exit + margin)
-    if t_end - t_start < 0.01:
-        t_start = max(0.0, t_enter - 0.03)
-        t_end = min(1.0, t_exit + 0.03)
-    P_start = interpolate_point_on_line(A, B, t_start)
-    P_end = interpolate_point_on_line(A, B, t_end)
-    # 将入点和出点投影到合并后的缓冲区边界上
-    start_on_buf, start_dist = point_on_polygon_boundary(P_start, exterior_coords)
-    end_on_buf, end_dist = point_on_polygon_boundary(P_end, exterior_coords)
-    ring = LinearRing(exterior_coords)
-    total_len = ring.length
-    # 计算顺时针和逆时针距离
-    if end_dist >= start_dist:
-        dist_cw = end_dist - start_dist
-        dist_ccw = total_len - dist_cw
-    else:
-        dist_ccw = start_dist - end_dist
-        dist_cw = total_len - dist_ccw
-    # 策略决定方向：向左绕行 = 顺时针，向右绕行 = 逆时针
-    if strategy == "向左绕行":
-        use_cw = True
-    elif strategy == "向右绕行":
-        use_cw = False
-    else:  # 最佳航线
-        use_cw = (dist_cw <= dist_ccw)
-    # 生成边界路径点
-    step_meters = 2.0
-    chosen_dist = dist_cw if use_cw else dist_ccw
-    num_steps = max(2, int(chosen_dist / step_meters))
-    boundary_points = []
-    if use_cw:
-        for i in range(num_steps + 1):
-            frac = i / num_steps
-            dist = start_dist + frac * dist_cw
-            if dist > total_len:
-                dist -= total_len
-            pt = ring.interpolate(dist)
-            boundary_points.append((pt.x, pt.y))
-    else:
-        for i in range(num_steps + 1):
-            frac = i / num_steps
-            dist = start_dist - frac * dist_ccw
-            if dist < 0:
-                dist += total_len
-            pt = ring.interpolate(dist)
-            boundary_points.append((pt.x, pt.y))
-    # 构建最终路径
-    path = [A]
-    # 如果起点到P_start有距离，添加中间直线点
-    if distance_meters(path[-1], P_start) > 0.1:
-        path.append(P_start)
-    # 添加边界点
-    for pt in boundary_points:
-        if distance_meters(path[-1], pt) > 0.1:
-            path.append(pt)
-    # 添加P_end
-    if distance_meters(path[-1], P_end) > 0.1:
-        path.append(P_end)
-    # 添加终点B
-    if distance_meters(path[-1], B) > 0.1:
-        path.append(B)
-    # 简化路径
-    simplified = [path[0]]
-    for i in range(1, len(path)-1):
-        p1 = simplified[-1]
-        p2 = path[i]
-        p3 = path[i+1]
-        if abs((p2[0]-p1[0])*(p3[1]-p2[1]) - (p2[1]-p1[1])*(p3[0]-p2[0])) > 1e-8:
-            simplified.append(p2)
-    simplified.append(path[-1])
-    return simplified
 
 # ==================== 创建地图 ====================
 def create_map(center_lat, center_lng, obstacles, A_wgs, B_wgs, flight_path, safe_radius):
@@ -369,7 +372,7 @@ def main():
     st.sidebar.write(f"{'✅' if a_set else '❌'} A点已设")
     st.sidebar.write(f"{'✅' if b_set else '❌'} B点已设")
     st.sidebar.markdown("---")
-    st.sidebar.info("🗺️ 卫星图源: Esri | 合并多个障碍物整体绕行，保持5米安全距离")
+    st.sidebar.info("🗺️ 卫星图源: Esri | 合并障碍物整体绕行，异常时降级为直线")
     
     # 初始化默认坐标 (GCJ-02)
     if "A_lat_gcj" not in st.session_state:
@@ -555,4 +558,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
